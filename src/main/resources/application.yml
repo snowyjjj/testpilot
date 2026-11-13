@@ -1,0 +1,23 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: testpilot
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+testpilot:
+  storage:
+    project-path: storage/projects
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
