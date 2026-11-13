@@ -150,4 +150,37 @@ class ProjectServiceImplTest {
         assertTrue(Files.exists(savedFile));
         assertFalse(Files.exists(tempDir.resolve("evil.zip")));
     }
+
+    @Test
+    void uploadProject_zipTooManyEntries_throwsException() throws IOException {
+        ReflectionTestUtils.setField(projectService, "maxZipEntries", 3);
+        String[] entries = new String[]{"a.txt", "b.txt", "c.txt", "d.txt", "pom.xml"};
+        byte[] zipBytes = createZip(entries);
+        MultipartFile file = new MockMultipartFile("file", "many.zip",
+                "application/zip", zipBytes);
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.uploadProject(file));
+        assertEquals(400, ex.getCode());
+        assertTrue(ex.getMessage().contains("条目数量"));
+    }
+
+    @Test
+    void uploadProject_zipDecompressedSizeExceeded_throwsException() throws IOException {
+        ReflectionTestUtils.setField(projectService, "maxZipDecompressedSize", 10L);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write(new byte[1024]);
+            zos.closeEntry();
+        }
+        byte[] zipBytes = baos.toByteArray();
+        MultipartFile file = new MockMultipartFile("file", "big.zip",
+                "application/zip", zipBytes);
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.uploadProject(file));
+        assertEquals(400, ex.getCode());
+        assertTrue(ex.getMessage().contains("解压数据量"));
+    }
 }

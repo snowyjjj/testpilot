@@ -22,6 +22,12 @@ public class ProjectServiceImpl implements ProjectService {
 
     private static final long MAX_FILE_SIZE = 50L * 1024 * 1024;
 
+    @Value("${testpilot.zip.max-entries:10000}")
+    private int maxZipEntries = 10000;
+
+    @Value("${testpilot.zip.max-decompressed-size:104857600}")
+    private long maxZipDecompressedSize = 100L * 1024 * 1024;
+
     @Value("${testpilot.storage.project-path:storage/projects}")
     private String projectStoragePath;
 
@@ -53,6 +59,9 @@ public class ProjectServiceImpl implements ProjectService {
 
     private void validateZipAndPom(MultipartFile file) {
         boolean pomFound = false;
+        int entryCount = 0;
+        long decompressedSize = 0;
+        byte[] buffer = new byte[8192];
         try (InputStream is = file.getInputStream();
              PushbackInputStream pis = new PushbackInputStream(is, 4)) {
             byte[] signature = new byte[4];
@@ -64,6 +73,17 @@ public class ProjectServiceImpl implements ProjectService {
             try (ZipInputStream zis = new ZipInputStream(pis)) {
                 ZipEntry entry;
                 while ((entry = zis.getNextEntry()) != null) {
+                    entryCount++;
+                    if (entryCount > maxZipEntries) {
+                        throw new BusinessException(400, "ZIP 条目数量超限");
+                    }
+                    int n;
+                    while ((n = zis.read(buffer)) > 0) {
+                        decompressedSize += n;
+                        if (decompressedSize > maxZipDecompressedSize) {
+                            throw new BusinessException(400, "ZIP 解压数据量超限");
+                        }
+                    }
                     if (isRootPom(entry.getName())) {
                         pomFound = true;
                     }
