@@ -16,6 +16,8 @@ import com.testpilot.dto.ParsedFile;
 import com.testpilot.dto.ProjectParseResponse;
 import com.testpilot.dto.ProjectUploadResponse;
 import com.testpilot.service.ProjectService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -26,8 +28,11 @@ import java.io.PushbackInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -36,6 +41,8 @@ import java.util.zip.ZipInputStream;
 
 @Service
 public class ProjectServiceImpl implements ProjectService {
+
+    private static final Logger log = LoggerFactory.getLogger(ProjectServiceImpl.class);
 
     private static final long MAX_FILE_SIZE = 50L * 1024 * 1024;
 
@@ -164,6 +171,7 @@ public class ProjectServiceImpl implements ProjectService {
             Files.createDirectories(projectDir);
             extractZip(zipFile, projectDir);
         } catch (IOException e) {
+            log.error("项目解压失败, projectId={}", projectId, e);
             throw new BusinessException(500, "项目解压失败");
         }
 
@@ -194,21 +202,74 @@ public class ProjectServiceImpl implements ProjectService {
     }
 
     private void extractZip(Path zipFile, Path targetDir) throws IOException {
+        // Phase 1: 预扫描所有条目，规范化路径并推断哪些是目录
+        // ZIP 规范要求目录条目以 '/' 结尾且 isDirectory()=true，但 Windows 工具常不遵守
+        // 推断规则：如果某条目不显式标记为目录，但其自身 isDirectory()=true
+        //           或以 '/' 结尾，或后续存在子条目引用它作为父路径，则视为目录
+        Set<String> inferredDirs = new HashSet<>();
+        List<String> allNames = new ArrayList<>();
+        try (InputStream fis = Files.newInputStream(zipFile);
+             ZipInputStream zis = new ZipInputStream(fis)) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                String normalized = entry.getName().replace("\\", "/");
+                allNames.add(normalized);
+                if (entry.isDirectory() || normalized.endsWith("/")) {
+                    // 显式目录或尾斜杠目录 → 去掉末尾斜杠加入推断集合
+                    String dirKey = normalized.endsWith("/")
+                            ? normalized.substring(0, normalized.length() - 1)
+                            : normalized;
+                    if (!dirKey.isEmpty()) {
+                        inferredDirs.add(dirKey);
+                    }
+                }
+                zis.closeEntry();
+            }
+        }
+
+        // 根据所有条目名构建完整目录集合：任何作为其他条目父路径的名称都是目录
+        for (String name : allNames) {
+            // 对每个条目的所有父路径，都加入推断目录集合
+            String trimmed = name.endsWith("/") ? name.substring(0, name.length() - 1) : name;
+            int slashIdx = trimmed.indexOf('/');
+            while (slashIdx >= 0) {
+                inferredDirs.add(trimmed.substring(0, slashIdx));
+                slashIdx = trimmed.indexOf('/', slashIdx + 1);
+            }
+        }
+
+        // Phase 2: 正式解压
         try (InputStream fis = Files.newInputStream(zipFile);
              ZipInputStream zis = new ZipInputStream(fis)) {
             ZipEntry entry;
             byte[] buffer = new byte[8192];
             while ((entry = zis.getNextEntry()) != null) {
                 String name = entry.getName().replace("\\", "/");
+
+                // 路径穿越校验
                 Path resolved = targetDir.resolve(name).normalize();
                 if (!resolved.startsWith(targetDir.normalize())) {
-                    throw new IOException("非法的 ZIP 条目路径: " + name);
+                    throw new IOException("非法的 ZIP 条目路径: " + entry.getName());
                 }
-                if (entry.isDirectory()) {
-                    Files.createDirectories(resolved);
-                } else {
-                    Files.createDirectories(resolved.getParent());
-                    Files.copy(zis, resolved, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+                // 综合判断是否目录：显式标记 / 尾斜杠 / 推断目录集合
+                String dirKey = name.endsWith("/") ? name.substring(0, name.length() - 1) : name;
+                boolean isDir = entry.isDirectory()
+                        || name.endsWith("/")
+                        || inferredDirs.contains(dirKey);
+
+                try {
+                    if (isDir) {
+                        Files.createDirectories(resolved);
+                    } else {
+                        if (resolved.getParent() != null) {
+                            Files.createDirectories(resolved.getParent());
+                        }
+                        Files.copy(zis, resolved, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (IOException e) {
+                    log.error("ZIP 条目解压失败, entry={}", entry.getName(), e);
+                    throw e;
                 }
                 zis.closeEntry();
             }

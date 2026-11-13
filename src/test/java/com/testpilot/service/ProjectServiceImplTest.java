@@ -394,4 +394,147 @@ class ProjectServiceImplTest {
         assertEquals(404, ex.getCode());
         assertTrue(ex.getMessage().contains("不存在"));
     }
+
+    @Test
+    void parseProject_normalDirectoryEntries_trailingSlash_work() throws IOException {
+        // 标准 ZIP：目录条目以 / 结尾且 isDirectory()=true
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            ZipEntry e1 = new ZipEntry("src/main/");
+            zos.putNextEntry(e1);
+            zos.closeEntry();
+
+            ZipEntry e2 = new ZipEntry("src/main/java/");
+            zos.putNextEntry(e2);
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+
+            ZipEntry e3 = new ZipEntry("src/main/java/X.java");
+            zos.putNextEntry(e3);
+            zos.write("public class X {}".getBytes());
+            zos.closeEntry();
+        }
+        String projectId = uploadAndGetId(baos.toByteArray(), "normal.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+        assertEquals(1, response.getFiles().size());
+        assertEquals("src/main/java/X.java", response.getFiles().get(0).getFilePath());
+    }
+
+    @Test
+    void parseProject_windowsBackslashEntries_work() throws IOException {
+        // Windows 风格：反斜杠分隔的条目，不以 / 结尾，isDirectory()=false
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            // 这些条目的 name 是 "src\main\"（注意：Java ZipEntry 仍会用正斜杠，但这里模拟特殊工具的输出）
+            // 我们直接写 "src/main" 且不以 / 结尾，模拟 isDirectory() 为 false 的目录
+            zos.putNextEntry(new ZipEntry("src/main"));
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("src/main/java"));
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("src/main/java/com"));
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+
+            ZipEntry e = new ZipEntry("src/main/java/com/X.java");
+            zos.putNextEntry(e);
+            zos.write("package com; public class X {}".getBytes());
+            zos.closeEntry();
+        }
+        String projectId = uploadAndGetId(baos.toByteArray(), "win-style.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+        assertEquals(1, response.getFiles().size());
+        assertEquals("src/main/java/com/X.java", response.getFiles().get(0).getFilePath());
+        assertEquals("com", response.getFiles().get(0).getPackageName());
+        assertTrue(response.getErrors().isEmpty());
+    }
+
+    @Test
+    void parseProject_missingDirectoryMarkers_butWithChildren_work() throws IOException {
+        // 目录条目完全缺失（既没有显式目录条目，也没有尾斜杠标记），只有文件条目
+        // 之前代码会因为父目录不存在而失败，现在应能自动推断父目录
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+
+            // 只有文件，没有任何目录条目
+            ZipEntry e = new ZipEntry("src/main/java/com/example/App.java");
+            zos.putNextEntry(e);
+            zos.write("public class App {}".getBytes());
+            zos.closeEntry();
+        }
+        String projectId = uploadAndGetId(baos.toByteArray(), "no-dir-entries.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+        assertEquals(1, response.getFiles().size());
+        assertEquals("src/main/java/com/example/App.java", response.getFiles().get(0).getFilePath());
+        assertTrue(response.getErrors().isEmpty());
+
+        // 确认目录确实创建出来了
+        Path extracted = tempDir.resolve("extracted").resolve(projectId);
+        assertTrue(Files.isDirectory(extracted.resolve("src/main/java/com/example")));
+        assertTrue(Files.isRegularFile(extracted.resolve("src/main/java/com/example/App.java")));
+    }
+
+    @Test
+    void parseProject_makefileNoExtension_notTreatedAsDirectory() throws IOException {
+        // 无扩展名的普通文件 Makefile 不应被误判为目录
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+
+            ZipEntry makefile = new ZipEntry("Makefile");
+            zos.putNextEntry(makefile);
+            zos.write("# build target\nall:\n\t@echo ok".getBytes());
+            zos.closeEntry();
+        }
+        String projectId = uploadAndGetId(baos.toByteArray(), "makefile.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+        // 没有 .java 文件，files 为空
+        assertTrue(response.getFiles().isEmpty());
+
+        // 但 Makefile 必须真实存在为文件，而不是目录
+        Path extracted = tempDir.resolve("extracted").resolve(projectId);
+        assertTrue(Files.isRegularFile(extracted.resolve("Makefile")),
+                "Makefile should be a regular file, not a directory");
+        assertFalse(Files.isDirectory(extracted.resolve("Makefile")));
+
+        // 确认文件内容正确
+        assertEquals("# build target",
+                Files.readAllLines(extracted.resolve("Makefile")).get(0));
+    }
+
+    @Test
+    void parseProject_pathTraversal_stillRejected() throws IOException {
+        // ZIP 路径穿越攻击：条目名包含 ../
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("../../evil.txt"));
+            zos.write("hacked!".getBytes());
+            zos.closeEntry();
+        }
+        String projectId = uploadAndGetId(baos.toByteArray(), "traversal.zip");
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.parseProject(projectId));
+        assertEquals(500, ex.getCode());
+    }
 }

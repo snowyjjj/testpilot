@@ -12,6 +12,12 @@ spring:
 testpilot:
   storage:
     project-path: storage/projects
+  llm:
+    base-url: https://ws-ksj13y5j5qjkb8jg.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    model: qwen-plus
+    api-key: ${DASHSCOPE_API_KEY:}
+    connect-timeout: 10
+    read-timeout: 60
 
 management:
   endpoints:
