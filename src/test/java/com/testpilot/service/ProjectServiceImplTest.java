@@ -1,6 +1,10 @@
 package com.testpilot.service;
 
 import com.testpilot.common.exception.BusinessException;
+import com.testpilot.dto.ClassInfo;
+import com.testpilot.dto.MethodInfo;
+import com.testpilot.dto.ParsedFile;
+import com.testpilot.dto.ProjectParseResponse;
 import com.testpilot.dto.ProjectUploadResponse;
 import com.testpilot.service.impl.ProjectServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,6 +34,8 @@ class ProjectServiceImplTest {
     void setUp() {
         projectService = new ProjectServiceImpl();
         ReflectionTestUtils.setField(projectService, "projectStoragePath", tempDir.toString());
+        ReflectionTestUtils.setField(projectService, "extractedStoragePath",
+                tempDir.resolve("extracted").toString());
     }
 
     private byte[] createZip(String... entries) throws IOException {
@@ -42,6 +48,24 @@ class ProjectServiceImplTest {
             }
         }
         return baos.toByteArray();
+    }
+
+    private byte[] createZipWithContents(java.util.Map<String, String> entries) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            for (java.util.Map.Entry<String, String> e : entries.entrySet()) {
+                zos.putNextEntry(new ZipEntry(e.getKey()));
+                zos.write(e.getValue().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                zos.closeEntry();
+            }
+        }
+        return baos.toByteArray();
+    }
+
+    private String uploadAndGetId(byte[] zipBytes, String fileName) throws IOException {
+        MultipartFile file = new MockMultipartFile("file", fileName,
+                "application/zip", zipBytes);
+        return projectService.uploadProject(file).getProjectId();
     }
 
     @Test
@@ -182,5 +206,192 @@ class ProjectServiceImplTest {
                 () -> projectService.uploadProject(file));
         assertEquals(400, ex.getCode());
         assertTrue(ex.getMessage().contains("解压数据量"));
+    }
+
+    @Test
+    void parseProject_normalClass_extractsMethodInfo() throws IOException {
+        String javaCode = "package com.example;\n\n"
+                + "public class Calculator {\n"
+                + "    public int add(int a, int b) {\n"
+                + "        return a + b;\n"
+                + "    }\n"
+                + "}\n";
+        java.util.Map<String, String> entries = new java.util.LinkedHashMap<>();
+        entries.put("pom.xml", "<project/>");
+        entries.put("src/Calculator.java", javaCode);
+        String projectId = uploadAndGetId(createZipWithContents(entries), "calc.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+
+        assertEquals(projectId, response.getProjectId());
+        assertEquals(1, response.getFiles().size());
+        assertTrue(response.getErrors().isEmpty());
+
+        ParsedFile file = response.getFiles().get(0);
+        assertEquals("src/Calculator.java", file.getFilePath());
+        assertEquals("com.example", file.getPackageName());
+        assertEquals(1, file.getClasses().size());
+
+        ClassInfo clazz = file.getClasses().get(0);
+        assertEquals("Calculator", clazz.getClassName());
+        assertEquals("class", clazz.getClassType());
+        assertEquals(1, clazz.getMethods().size());
+
+        MethodInfo method = clazz.getMethods().get(0);
+        assertEquals("add", method.getName());
+        assertEquals("int", method.getReturnType());
+        assertEquals("public", method.getAccessModifier());
+        assertFalse(method.isStatic());
+        assertEquals(2, method.getParameters().size());
+        assertEquals("a", method.getParameters().get(0).getName());
+        assertEquals("int", method.getParameters().get(0).getType());
+        assertEquals("b", method.getParameters().get(1).getName());
+        assertTrue(method.getSource().contains("return a + b;"));
+    }
+
+    @Test
+    void parseProject_classWithMultipleMethods_extractsAll() throws IOException {
+        String javaCode = "package com.example;\n\n"
+                + "public class Service {\n"
+                + "    public void doWork() {}\n"
+                + "    private String helper() { return \"x\"; }\n"
+                + "    protected int count() { return 0; }\n"
+                + "}\n";
+        java.util.Map<String, String> entries = new java.util.LinkedHashMap<>();
+        entries.put("pom.xml", "<project/>");
+        entries.put("src/Service.java", javaCode);
+        String projectId = uploadAndGetId(createZipWithContents(entries), "svc.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+
+        ClassInfo clazz = response.getFiles().get(0).getClasses().get(0);
+        assertEquals(3, clazz.getMethods().size());
+        assertEquals("doWork", clazz.getMethods().get(0).getName());
+        assertEquals("helper", clazz.getMethods().get(1).getName());
+        assertEquals("count", clazz.getMethods().get(2).getName());
+    }
+
+    @Test
+    void parseProject_staticMethod_extractsStaticFlag() throws IOException {
+        String javaCode = "package com.example;\n\n"
+                + "public class MathUtil {\n"
+                + "    public static int square(int x) {\n"
+                + "        return x * x;\n"
+                + "    }\n"
+                + "}\n";
+        java.util.Map<String, String> entries = new java.util.LinkedHashMap<>();
+        entries.put("pom.xml", "<project/>");
+        entries.put("src/MathUtil.java", javaCode);
+        String projectId = uploadAndGetId(createZipWithContents(entries), "math.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+
+        MethodInfo method = response.getFiles().get(0).getClasses().get(0).getMethods().get(0);
+        assertEquals("square", method.getName());
+        assertTrue(method.isStatic());
+        assertEquals("int", method.getReturnType());
+    }
+
+    @Test
+    void parseProject_interfaceAndEnum_extractsCorrectTypes() throws IOException {
+        String interfaceCode = "package com.example;\n\n"
+                + "public interface Greeter {\n"
+                + "    String greet(String name);\n"
+                + "}\n";
+        String enumCode = "package com.example;\n\n"
+                + "public enum Color {\n"
+                + "    RED, GREEN, BLUE;\n"
+                + "    public String lowerName() {\n"
+                + "        return name().toLowerCase();\n"
+                + "    }\n"
+                + "}\n";
+        java.util.Map<String, String> entries = new java.util.LinkedHashMap<>();
+        entries.put("pom.xml", "<project/>");
+        entries.put("src/Greeter.java", interfaceCode);
+        entries.put("src/Color.java", enumCode);
+        String projectId = uploadAndGetId(createZipWithContents(entries), "types.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+
+        assertEquals(2, response.getFiles().size());
+        assertTrue(response.getErrors().isEmpty());
+
+        ClassInfo greeter = findClassByName(response, "Greeter");
+        assertEquals("interface", greeter.getClassType());
+        assertEquals(1, greeter.getMethods().size());
+        assertEquals("greet", greeter.getMethods().get(0).getName());
+
+        ClassInfo color = findClassByName(response, "Color");
+        assertEquals("enum", color.getClassType());
+        assertEquals(1, color.getMethods().size());
+        assertEquals("lowerName", color.getMethods().get(0).getName());
+    }
+
+    private ClassInfo findClassByName(ProjectParseResponse response, String name) {
+        return response.getFiles().stream()
+                .flatMap(f -> f.getClasses().stream())
+                .filter(c -> name.equals(c.getClassName()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("Class not found: " + name));
+    }
+
+    @Test
+    void parseProject_emptyAndInvalidFiles_recordsErrorsWithoutStopping() throws IOException {
+        String validCode = "package com.example;\n\n"
+                + "public class Valid {\n"
+                + "    public void run() {}\n"
+                + "}\n";
+        java.util.Map<String, String> entries = new java.util.LinkedHashMap<>();
+        entries.put("pom.xml", "<project/>");
+        entries.put("src/Empty.java", "");
+        entries.put("src/Invalid.java", "this is not valid java {{{");
+        entries.put("src/Valid.java", validCode);
+        String projectId = uploadAndGetId(createZipWithContents(entries), "mixed.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+
+        assertEquals(2, response.getFiles().size());
+        assertEquals(1, response.getErrors().size());
+
+        ParsedFile emptyFile = response.getFiles().stream()
+                .filter(f -> "src/Empty.java".equals(f.getFilePath()))
+                .findFirst().orElseThrow();
+        assertTrue(emptyFile.getClasses().isEmpty());
+
+        assertEquals("src/Valid.java", response.getFiles().stream()
+                .filter(f -> f.getFilePath().equals("src/Valid.java"))
+                .findFirst().orElseThrow().getFilePath());
+        assertEquals("Valid", findClassByName(response, "Valid").getClassName());
+
+        assertEquals("src/Invalid.java", response.getErrors().get(0).getFilePath());
+    }
+
+    @Test
+    void parseProject_multipleJavaFiles_parsesAll() throws IOException {
+        String code1 = "package com.example;\n\npublic class A { public void a() {} }\n";
+        String code2 = "package com.example;\n\npublic class B { public void b() {} }\n";
+        String code3 = "package com.example;\n\npublic class C { public void c() {} }\n";
+        java.util.Map<String, String> entries = new java.util.LinkedHashMap<>();
+        entries.put("pom.xml", "<project/>");
+        entries.put("src/A.java", code1);
+        entries.put("src/B.java", code2);
+        entries.put("src/C.java", code3);
+        String projectId = uploadAndGetId(createZipWithContents(entries), "multi.zip");
+
+        ProjectParseResponse response = projectService.parseProject(projectId);
+
+        assertEquals(3, response.getFiles().size());
+        assertTrue(response.getErrors().isEmpty());
+        assertEquals("A", response.getFiles().get(0).getClasses().get(0).getClassName());
+        assertEquals("B", response.getFiles().get(1).getClasses().get(0).getClassName());
+        assertEquals("C", response.getFiles().get(2).getClasses().get(0).getClassName());
+    }
+
+    @Test
+    void parseProject_notFound_throwsException() {
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.parseProject("nonexistent"));
+        assertEquals(404, ex.getCode());
+        assertTrue(ex.getMessage().contains("不存在"));
     }
 }

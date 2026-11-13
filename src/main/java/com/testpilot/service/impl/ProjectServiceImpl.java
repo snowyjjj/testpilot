@@ -1,6 +1,19 @@
 package com.testpilot.service.impl;
 
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.EnumDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.RecordDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
 import com.testpilot.common.exception.BusinessException;
+import com.testpilot.dto.ClassInfo;
+import com.testpilot.dto.MethodInfo;
+import com.testpilot.dto.MethodParameter;
+import com.testpilot.dto.ParseError;
+import com.testpilot.dto.ParsedFile;
+import com.testpilot.dto.ProjectParseResponse;
 import com.testpilot.dto.ProjectUploadResponse;
 import com.testpilot.service.ProjectService;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,7 +26,11 @@ import java.io.PushbackInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -30,6 +47,9 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Value("${testpilot.storage.project-path:storage/projects}")
     private String projectStoragePath;
+
+    @Value("${testpilot.storage.extracted-path:storage/extracted}")
+    private String extractedStoragePath;
 
     @Override
     public ProjectUploadResponse uploadProject(MultipartFile file) {
@@ -121,5 +141,141 @@ public class ProjectServiceImpl implements ProjectService {
             return true;
         }
         return false;
+    }
+
+    @Override
+    public ProjectParseResponse parseProject(String projectId) {
+        if (projectId == null || projectId.isBlank()) {
+            throw new BusinessException(400, "项目 ID 不能为空");
+        }
+
+        Path zipFile = Paths.get(projectStoragePath).toAbsolutePath().normalize()
+                .resolve(projectId + ".zip");
+        if (!Files.exists(zipFile)) {
+            throw new BusinessException(404, "项目不存在");
+        }
+
+        Path projectDir = Paths.get(extractedStoragePath).toAbsolutePath().normalize()
+                .resolve(projectId);
+        try {
+            if (Files.exists(projectDir)) {
+                deleteDirectory(projectDir);
+            }
+            Files.createDirectories(projectDir);
+            extractZip(zipFile, projectDir);
+        } catch (IOException e) {
+            throw new BusinessException(500, "项目解压失败");
+        }
+
+        List<ParsedFile> files = new ArrayList<>();
+        List<ParseError> errors = new ArrayList<>();
+
+        try (Stream<Path> paths = Files.walk(projectDir)) {
+            List<Path> javaFiles = paths
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .sorted()
+                    .collect(Collectors.toList());
+            for (Path javaFile : javaFiles) {
+                String relativePath = projectDir.relativize(javaFile).toString()
+                        .replace("\\", "/");
+                try {
+                    ParsedFile parsed = parseJavaFile(javaFile, relativePath);
+                    files.add(parsed);
+                } catch (Exception e) {
+                    errors.add(new ParseError(relativePath, e.getMessage()));
+                }
+            }
+        } catch (IOException e) {
+            throw new BusinessException(500, "遍历项目源码失败");
+        }
+
+        return new ProjectParseResponse(projectId, files, errors);
+    }
+
+    private void extractZip(Path zipFile, Path targetDir) throws IOException {
+        try (InputStream fis = Files.newInputStream(zipFile);
+             ZipInputStream zis = new ZipInputStream(fis)) {
+            ZipEntry entry;
+            byte[] buffer = new byte[8192];
+            while ((entry = zis.getNextEntry()) != null) {
+                String name = entry.getName().replace("\\", "/");
+                Path resolved = targetDir.resolve(name).normalize();
+                if (!resolved.startsWith(targetDir.normalize())) {
+                    throw new IOException("非法的 ZIP 条目路径: " + name);
+                }
+                if (entry.isDirectory()) {
+                    Files.createDirectories(resolved);
+                } else {
+                    Files.createDirectories(resolved.getParent());
+                    Files.copy(zis, resolved, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                zis.closeEntry();
+            }
+        }
+    }
+
+    private ParsedFile parseJavaFile(Path javaFile, String relativePath) throws IOException {
+        CompilationUnit cu = StaticJavaParser.parse(javaFile);
+        String packageName = cu.getPackageDeclaration()
+                .map(pd -> pd.getNameAsString())
+                .orElse("");
+
+        List<ClassInfo> classes = new ArrayList<>();
+        for (TypeDeclaration<?> type : cu.getTypes()) {
+            classes.add(toClassInfo(type));
+        }
+        return new ParsedFile(relativePath, packageName, classes);
+    }
+
+    private ClassInfo toClassInfo(TypeDeclaration<?> type) {
+        String className = type.getNameAsString();
+        String classType = resolveClassType(type);
+        List<MethodInfo> methods = new ArrayList<>();
+        for (MethodDeclaration method : type.getMethods()) {
+            methods.add(toMethodInfo(method));
+        }
+        return new ClassInfo(className, classType, methods);
+    }
+
+    private String resolveClassType(TypeDeclaration<?> type) {
+        if (type instanceof ClassOrInterfaceDeclaration) {
+            return ((ClassOrInterfaceDeclaration) type).isInterface() ? "interface" : "class";
+        }
+        if (type instanceof EnumDeclaration) {
+            return "enum";
+        }
+        if (type instanceof RecordDeclaration) {
+            return "record";
+        }
+        return "class";
+    }
+
+    private MethodInfo toMethodInfo(MethodDeclaration method) {
+        String name = method.getNameAsString();
+        String returnType = method.getType().asString();
+        String accessModifier = method.getAccessSpecifier().asString();
+        if (accessModifier.isEmpty()) {
+            accessModifier = "default";
+        }
+        boolean isStatic = method.isStatic();
+        List<MethodParameter> parameters = method.getParameters().stream()
+                .map(p -> new MethodParameter(p.getNameAsString(), p.getType().asString()))
+                .collect(Collectors.toList());
+        String source = method.toString();
+        return new MethodInfo(name, returnType, accessModifier, isStatic, parameters, source);
+    }
+
+    private void deleteDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> paths = Files.walk(dir)) {
+            List<Path> sorted = paths.sorted((a, b) -> b.getNameCount() - a.getNameCount())
+                    .collect(Collectors.toList());
+            for (Path p : sorted) {
+                Files.deleteIfExists(p);
+            }
+        }
     }
 }
