@@ -9,6 +9,9 @@ public enum JUnitVersion {
 
     JUNIT5("JUnit 5"),
 
+    /** 同时声明了 JUnit 4 和 JUnit 5，无法唯一确定。 */
+    CONFLICT("冲突"),
+
     UNKNOWN("未知");
 
     private final String displayName;

@@ -245,7 +245,8 @@ class TestGenerationServiceImplTest {
     }
 
     @Test
-    void junitDetector_springBootParent22_returnsJUnit5() throws IOException {
+    void junitDetector_springBootParentOnly_returnsUnknown() throws IOException {
+        // 仅有 Spring Boot Parent，没有任何测试依赖，不能仅凭 Parent 判定 JUnit 5
         String pom = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                 + "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
                 + "  <modelVersion>4.0.0</modelVersion>\n"
@@ -254,7 +255,81 @@ class TestGenerationServiceImplTest {
                 + "  <groupId>com.example</groupId>\n  <artifactId>demo</artifactId>\n  <version>1.0</version>\n"
                 + "</project>\n";
         Files.writeString(tempDir.resolve("pom.xml"), pom, StandardCharsets.UTF_8);
+        assertEquals(JUnitVersion.UNKNOWN, JUnitDetector.detect(tempDir));
+    }
+
+    @Test
+    void junitDetector_springBootStarterTestWithParent_returnsJUnit5() throws IOException {
+        // 实际声明 spring-boot-starter-test，版本由 spring-boot-starter-parent 继承
+        String pom = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <parent>\n    <groupId>org.springframework.boot</groupId>\n"
+                + "    <artifactId>spring-boot-starter-parent</artifactId>\n    <version>2.7.0</version>\n  </parent>\n"
+                + "  <groupId>com.example</groupId>\n  <artifactId>demo</artifactId>\n  <version>1.0</version>\n"
+                + "  <dependencies>\n    <dependency>\n      <groupId>org.springframework.boot</groupId>\n"
+                + "      <artifactId>spring-boot-starter-test</artifactId>\n      <scope>test</scope>\n    </dependency>\n"
+                + "  </dependencies>\n"
+                + "</project>\n";
+        Files.writeString(tempDir.resolve("pom.xml"), pom, StandardCharsets.UTF_8);
         assertEquals(JUnitVersion.JUNIT5, JUnitDetector.detect(tempDir));
+    }
+
+    @Test
+    void junitDetector_dependencyManagementOnlyJUnit5_returnsUnknown() throws IOException {
+        // 仅在 dependencyManagement 中声明 junit-bom，无实际 junit 依赖 → 不能判定为 JUnit 5
+        String pom = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>com.example</groupId>\n  <artifactId>demo</artifactId>\n  <version>1.0</version>\n"
+                + "  <dependencyManagement>\n    <dependencies>\n      <dependency>\n"
+                + "        <groupId>org.junit</groupId>\n        <artifactId>junit-bom</artifactId>\n"
+                + "        <version>5.10.0</version>\n        <type>pom</type>\n        <scope>import</scope>\n"
+                + "      </dependency>\n    </dependencies>\n  </dependencyManagement>\n"
+                + "  <dependencies>\n    <dependency>\n      <groupId>com.google.guava</groupId>\n"
+                + "      <artifactId>guava</artifactId>\n      <version>32.0.0-jre</version>\n    </dependency>\n  </dependencies>\n"
+                + "</project>\n";
+        Files.writeString(tempDir.resolve("pom.xml"), pom, StandardCharsets.UTF_8);
+        assertEquals(JUnitVersion.UNKNOWN, JUnitDetector.detect(tempDir));
+    }
+
+    @Test
+    void junitDetector_dependencyManagementJUnit5WithJUnit4Actual_returnsJUnit4() throws IOException {
+        // dependencyManagement 管理 JUnit 5 BOM，但实际依赖声明的是 JUnit 4 → 以实际依赖为准
+        String pom = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>com.example</groupId>\n  <artifactId>demo</artifactId>\n  <version>1.0</version>\n"
+                + "  <dependencyManagement>\n    <dependencies>\n      <dependency>\n"
+                + "        <groupId>org.junit</groupId>\n        <artifactId>junit-bom</artifactId>\n"
+                + "        <version>5.10.0</version>\n        <type>pom</type>\n        <scope>import</scope>\n"
+                + "      </dependency>\n    </dependencies>\n  </dependencyManagement>\n"
+                + "  <dependencies>\n    <dependency>\n      <groupId>junit</groupId>\n"
+                + "      <artifactId>junit</artifactId>\n      <version>4.13.2</version>\n      <scope>test</scope>\n    </dependency>\n  </dependencies>\n"
+                + "</project>\n";
+        Files.writeString(tempDir.resolve("pom.xml"), pom, StandardCharsets.UTF_8);
+        assertEquals(JUnitVersion.JUNIT4, JUnitDetector.detect(tempDir));
+    }
+
+    @Test
+    void junitDetector_bothJUnit4AndJUnit5_returnsConflict() throws IOException {
+        // 同时实际声明 JUnit 4 和 JUnit 5 → 冲突
+        String both = JUNIT4_DEP + JUNIT5_DEP;
+        writePom(tempDir, both);
+        assertEquals(JUnitVersion.CONFLICT, JUnitDetector.detect(tempDir));
+    }
+
+    @Test
+    void junitDetector_maliciousXxeXml_returnsUnknownSafely() throws IOException {
+        // 恶意 XXE：DOCTYPE + 外部实体，解析器应拒绝加载，不崩溃，返回 UNKNOWN
+        String pom = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>\n"
+                + "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+                + "  <modelVersion>4.0.0</modelVersion>\n"
+                + "  <groupId>&xxe;</groupId>\n  <artifactId>demo</artifactId>\n  <version>1.0</version>\n"
+                + "</project>\n";
+        Files.writeString(tempDir.resolve("pom.xml"), pom, StandardCharsets.UTF_8);
+        assertEquals(JUnitVersion.UNKNOWN, JUnitDetector.detect(tempDir));
     }
 
     @Test

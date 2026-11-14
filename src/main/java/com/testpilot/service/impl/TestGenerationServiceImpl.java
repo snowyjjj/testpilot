@@ -39,6 +39,9 @@ public class TestGenerationServiceImpl implements TestGenerationService {
         if (junitVersion == JUnitVersion.UNKNOWN) {
             throw new BusinessException(400, "无法识别项目的 JUnit 版本，请在 pom.xml 中声明 junit 或 org.junit.jupiter 依赖");
         }
+        if (junitVersion == JUnitVersion.CONFLICT) {
+            throw new BusinessException(400, "项目同时声明了 JUnit 4 和 JUnit 5 依赖，无法确定测试框架版本，请移除其中一个");
+        }
         log.info("检测到项目 JUnit 版本: {}", junitVersion.getDisplayName());
 
         // 3. 构建 Prompt
