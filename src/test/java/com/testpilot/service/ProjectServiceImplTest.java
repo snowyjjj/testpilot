@@ -638,4 +638,43 @@ class ProjectServiceImplTest {
                         java.util.List.of()));
         assertEquals(400, ex.getCode());
     }
+
+    @Test
+    void getMavenProjectDir_pomAtRoot_returnsExtractedDir() throws IOException {
+        String projectId = uploadCalculatorProject();
+        Path projectDir = projectService.getMavenProjectDir(projectId);
+        assertNotNull(projectDir);
+        assertTrue(Files.isRegularFile(projectDir.resolve("pom.xml")));
+    }
+
+    @Test
+    void getMavenProjectDir_pomInSingleSubdir_returnsSubdir() throws IOException {
+        // ZIP 内含单层子目录，pom.xml 位于子目录中
+        String projectId = uploadAndGetId(createZipWithContents(
+                java.util.Map.of("myapp/pom.xml", "<project/>",
+                        "myapp/src/main/java/App.java", "class App {}")), "sub.zip");
+        Path projectDir = projectService.getMavenProjectDir(projectId);
+        assertNotNull(projectDir);
+        assertEquals("myapp", projectDir.getFileName().toString());
+        assertTrue(Files.isRegularFile(projectDir.resolve("pom.xml")));
+    }
+
+    @Test
+    void getMavenProjectDir_noPom_throws404() throws IOException {
+        String projectId = uploadCalculatorProject();
+        // 触发解压后删除 pom.xml，模拟无 pom 的情况
+        Path extracted = projectService.getProjectDir(projectId);
+        Files.delete(extracted.resolve("pom.xml"));
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.getMavenProjectDir(projectId));
+        assertEquals(404, ex.getCode());
+        assertTrue(ex.getMessage().contains("pom.xml"));
+    }
+
+    @Test
+    void getMavenProjectDir_blankId_throws400() {
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.getMavenProjectDir("  "));
+        assertEquals(400, ex.getCode());
+    }
 }

@@ -271,6 +271,38 @@ public class ProjectServiceImpl implements ProjectService {
         return ensureExtracted(projectId);
     }
 
+    @Override
+    public Path getMavenProjectDir(String projectId) {
+        if (projectId == null || projectId.isBlank()) {
+            throw new BusinessException(400, "项目 ID 不能为空");
+        }
+        Path extractedDir = ensureExtracted(projectId);
+
+        // 1. 解压根目录直接有 pom.xml
+        Path rootPom = extractedDir.resolve("pom.xml");
+        if (Files.isRegularFile(rootPom)) {
+            return extractedDir;
+        }
+
+        // 2. 向下搜索一层（兼容 ZIP 内单层子目录）
+        try (Stream<Path> stream = Files.list(extractedDir)) {
+            List<Path> subDirs = stream
+                    .filter(Files::isDirectory)
+                    .sorted()
+                    .collect(Collectors.toList());
+            for (Path sub : subDirs) {
+                Path subPom = sub.resolve("pom.xml");
+                if (Files.isRegularFile(subPom)) {
+                    return sub;
+                }
+            }
+        } catch (IOException e) {
+            throw new BusinessException(500, "遍历项目目录失败");
+        }
+
+        throw new BusinessException(404, "未找到 pom.xml，无法定位 Maven 项目根目录");
+    }
+
     /**
      * 确保项目已解压。若解压目录已存在则直接复用，不再重新解压。
      * 解压失败时清理本次产生的不完整目录，保留原始 ZIP。

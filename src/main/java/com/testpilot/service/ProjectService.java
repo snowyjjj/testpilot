@@ -29,4 +29,11 @@ public interface ProjectService {
      * 返回项目解压根目录的绝对路径。仅当项目已解压时返回。
      */
     Path getProjectDir(String projectId);
+
+    /**
+     * 返回 Maven 项目根目录（包含 pom.xml 的目录）。
+     * 兼容 ZIP 内包含单层子目录的情况：先查解压根目录，再向下搜索一层。
+     * 找不到 pom.xml 时抛出业务异常。
+     */
+    Path getMavenProjectDir(String projectId);
 }

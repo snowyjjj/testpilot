@@ -12,6 +12,13 @@ spring:
 testpilot:
   storage:
     project-path: storage/projects
+  maven:
+    # Maven 可执行文件，留空则按操作系统自动选择（Windows: mvn.cmd，其他: mvn）
+    executable: ""
+    # 执行超时（秒）
+    timeout-seconds: 120
+    # 日志最大保留字符数
+    max-log-length: 51200
   llm:
     base-url: https://ws-ksj13y5j5qjkb8jg.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     model: qwen-plus
