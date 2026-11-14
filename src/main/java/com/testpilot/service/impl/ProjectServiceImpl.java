@@ -9,6 +9,7 @@ import com.github.javaparser.ast.body.RecordDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.testpilot.common.exception.BusinessException;
 import com.testpilot.dto.ClassInfo;
+import com.testpilot.dto.MethodContext;
 import com.testpilot.dto.MethodInfo;
 import com.testpilot.dto.MethodParameter;
 import com.testpilot.dto.ParseError;
@@ -156,24 +157,7 @@ public class ProjectServiceImpl implements ProjectService {
             throw new BusinessException(400, "项目 ID 不能为空");
         }
 
-        Path zipFile = Paths.get(projectStoragePath).toAbsolutePath().normalize()
-                .resolve(projectId + ".zip");
-        if (!Files.exists(zipFile)) {
-            throw new BusinessException(404, "项目不存在");
-        }
-
-        Path projectDir = Paths.get(extractedStoragePath).toAbsolutePath().normalize()
-                .resolve(projectId);
-        try {
-            if (Files.exists(projectDir)) {
-                deleteDirectory(projectDir);
-            }
-            Files.createDirectories(projectDir);
-            extractZip(zipFile, projectDir);
-        } catch (IOException e) {
-            log.error("项目解压失败, projectId={}", projectId, e);
-            throw new BusinessException(500, "项目解压失败");
-        }
+        Path projectDir = ensureExtracted(projectId);
 
         List<ParsedFile> files = new ArrayList<>();
         List<ParseError> errors = new ArrayList<>();
@@ -199,6 +183,146 @@ public class ProjectServiceImpl implements ProjectService {
         }
 
         return new ProjectParseResponse(projectId, files, errors);
+    }
+
+    @Override
+    public MethodContext getMethodContext(String projectId, String className, String methodName,
+                                           List<String> paramTypes) {
+        if (projectId == null || projectId.isBlank()) {
+            throw new BusinessException(400, "项目 ID 不能为空");
+        }
+        if (className == null || className.isBlank()) {
+            throw new BusinessException(400, "类名不能为空");
+        }
+        if (methodName == null || methodName.isBlank()) {
+            throw new BusinessException(400, "方法名不能为空");
+        }
+
+        Path projectDir = ensureExtracted(projectId);
+
+        // 遍历所有 .java 文件，定位目标类
+        List<Path> javaFiles;
+        try (Stream<Path> paths = Files.walk(projectDir)) {
+            javaFiles = paths
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .collect(Collectors.toList());
+        } catch (IOException e) {
+            throw new BusinessException(500, "遍历项目源码失败");
+        }
+
+        // 按文件名匹配类名（Java 规范要求 public class 与文件名一致，这里放宽为包含目标类即可）
+        for (Path javaFile : javaFiles) {
+            String relativePath = projectDir.relativize(javaFile).toString().replace("\\", "/");
+            CompilationUnit cu;
+            try {
+                cu = StaticJavaParser.parse(javaFile);
+            } catch (Exception e) {
+                continue;
+            }
+            for (TypeDeclaration<?> type : cu.getTypes()) {
+                if (!className.equals(type.getNameAsString())) {
+                    continue;
+                }
+                // 找到目标类，在其方法中匹配
+                List<MethodDeclaration> candidates = type.getMethods().stream()
+                        .filter(m -> methodName.equals(m.getNameAsString()))
+                        .filter(m -> matchParameters(m, paramTypes))
+                        .collect(Collectors.toList());
+
+                if (candidates.isEmpty()) {
+                    continue;
+                }
+                if (candidates.size() > 1) {
+                    throw new BusinessException(400, "方法匹配不唯一，存在多个重载，请提供更精确的参数类型");
+                }
+
+                MethodDeclaration method = candidates.get(0);
+
+                // 访问修饰符校验：仅允许 public 和 default（包级可见）
+                String access = method.getAccessSpecifier().asString();
+                if ("private".equals(access) || "protected".equals(access)) {
+                    throw new BusinessException(400, "暂不支持为 private/protected 方法生成测试");
+                }
+
+                String packageName = cu.getPackageDeclaration()
+                        .map(pd -> pd.getNameAsString())
+                        .orElse("");
+                String classSource;
+                try {
+                    classSource = Files.readString(javaFile);
+                } catch (IOException e) {
+                    classSource = cu.toString();
+                }
+
+                MethodInfo methodInfo = toMethodInfo(method);
+                return new MethodContext(packageName, className, relativePath, classSource, methodInfo);
+            }
+        }
+
+        throw new BusinessException(404, "未找到方法: " + className + "." + methodName);
+    }
+
+    @Override
+    public Path getProjectDir(String projectId) {
+        if (projectId == null || projectId.isBlank()) {
+            throw new BusinessException(400, "项目 ID 不能为空");
+        }
+        return ensureExtracted(projectId);
+    }
+
+    /**
+     * 确保项目已解压。若解压目录已存在则直接复用，不再重新解压。
+     * 解压失败时清理本次产生的不完整目录，保留原始 ZIP。
+     */
+    private Path ensureExtracted(String projectId) {
+        Path zipFile = Paths.get(projectStoragePath).toAbsolutePath().normalize()
+                .resolve(projectId + ".zip");
+        if (!Files.exists(zipFile)) {
+            throw new BusinessException(404, "项目不存在");
+        }
+
+        Path projectDir = Paths.get(extractedStoragePath).toAbsolutePath().normalize()
+                .resolve(projectId);
+        if (Files.exists(projectDir)) {
+            return projectDir;
+        }
+
+        try {
+            Files.createDirectories(projectDir);
+            extractZip(zipFile, projectDir);
+        } catch (IOException e) {
+            log.error("项目解压失败, projectId={}", projectId, e);
+            // 清理本次产生的不完整目录，保留原始 ZIP
+            try {
+                deleteDirectory(projectDir);
+            } catch (IOException cleanupEx) {
+                log.warn("清理不完整解压目录失败, projectId={}", projectId, cleanupEx);
+            }
+            throw new BusinessException(500, "项目解压失败");
+        }
+        return projectDir;
+    }
+
+    /**
+     * 匹配方法参数。比较参数数量和参数类型字符串（去除空白后比较）。
+     */
+    private boolean matchParameters(MethodDeclaration method, List<String> expectedTypes) {
+        List<String> actualTypes = method.getParameters().stream()
+                .map(p -> normalizeType(p.getType().asString()))
+                .collect(Collectors.toList());
+        List<String> expected = (expectedTypes == null ? List.<String>of() : expectedTypes).stream()
+                .map(this::normalizeType)
+                .collect(Collectors.toList());
+        return actualTypes.equals(expected);
+    }
+
+    private String normalizeType(String type) {
+        if (type == null) {
+            return "";
+        }
+        // 去除多余空白，保留泛型尖括号内的内容
+        return type.replaceAll("\\s+", "").trim();
     }
 
     private void extractZip(Path zipFile, Path targetDir) throws IOException {

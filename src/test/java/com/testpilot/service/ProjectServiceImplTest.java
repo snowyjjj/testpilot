@@ -537,4 +537,105 @@ class ProjectServiceImplTest {
                 () -> projectService.parseProject(projectId));
         assertEquals(500, ex.getCode());
     }
+
+    // ============ 解压目录复用测试 ============
+
+    @Test
+    void parseProject_existingDirIsReused_notReExtracted() throws IOException {
+        // 首次解压
+        String projectId = uploadAndGetId(createZipWithContents(
+                java.util.Map.of("pom.xml", "<project/>",
+                        "src/main/java/com/example/App.java",
+                        "package com.example;\npublic class App {}")), "reuse.zip");
+        projectService.parseProject(projectId);
+
+        Path projectDir = tempDir.resolve("extracted").resolve(projectId);
+        // 在解压目录中放一个标记文件
+        Path marker = projectDir.resolve("marker.txt");
+        Files.writeString(marker, "keep-me");
+
+        // 再次 parseProject，不应删除已有目录
+        projectService.parseProject(projectId);
+
+        assertTrue(Files.exists(marker), "已存在的标记文件应保留，不应被重新解压删除");
+    }
+
+    @Test
+    void parseProject_testFileSurvivesRepeatedParse() throws IOException {
+        String projectId = uploadAndGetId(createZipWithContents(
+                java.util.Map.of("pom.xml", "<project/>",
+                        "src/main/java/com/example/Calc.java",
+                        "package com.example;\npublic class Calc { public int add(int a,int b){return a+b;} }")),
+                "survive.zip");
+        projectService.parseProject(projectId);
+
+        Path projectDir = tempDir.resolve("extracted").resolve(projectId);
+        // 模拟已生成的测试文件
+        Path testFile = projectDir.resolve("src/test/java/com/example/CalcTest.java");
+        Files.createDirectories(testFile.getParent());
+        Files.writeString(testFile, "package com.example;\nclass CalcTest {}");
+
+        // 再次 parseProject
+        projectService.parseProject(projectId);
+
+        assertTrue(Files.exists(testFile), "已生成的测试文件不应被 parseProject 删除");
+    }
+
+    // ============ 方法定位测试 ============
+
+    private String uploadCalculatorProject() throws IOException {
+        String src = "package com.example;\n"
+                + "public class Calculator {\n"
+                + "  public int add(int a, int b) { return a + b; }\n"
+                + "  public double add(double a, double b) { return a + b; }\n"
+                + "  private int secret() { return 42; }\n"
+                + "  protected void doProtected() {}\n"
+                + "}";
+        return uploadAndGetId(createZipWithContents(
+                java.util.Map.of("pom.xml", "<project/>",
+                        "src/main/java/com/example/Calculator.java", src)), "calc.zip");
+    }
+
+    @Test
+    void getMethodContext_overloadedMethod_distinguishedByParamTypes() throws IOException {
+        String projectId = uploadCalculatorProject();
+
+        var ctx1 = projectService.getMethodContext(projectId, "Calculator", "add",
+                java.util.List.of("int", "int"));
+        assertEquals("add", ctx1.getMethodInfo().getName());
+        assertEquals("int", ctx1.getMethodInfo().getReturnType());
+        assertEquals(2, ctx1.getMethodInfo().getParameters().size());
+
+        var ctx2 = projectService.getMethodContext(projectId, "Calculator", "add",
+                java.util.List.of("double", "double"));
+        assertEquals("double", ctx2.getMethodInfo().getReturnType());
+    }
+
+    @Test
+    void getMethodContext_methodNotFound_throwsException() throws IOException {
+        String projectId = uploadCalculatorProject();
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.getMethodContext(projectId, "Calculator", "nonexist",
+                        java.util.List.of()));
+        assertEquals(404, ex.getCode());
+    }
+
+    @Test
+    void getMethodContext_privateMethod_rejected() throws IOException {
+        String projectId = uploadCalculatorProject();
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.getMethodContext(projectId, "Calculator", "secret",
+                        java.util.List.of()));
+        assertEquals(400, ex.getCode());
+        assertTrue(ex.getMessage().contains("private"));
+    }
+
+    @Test
+    void getMethodContext_protectedMethod_rejected() throws IOException {
+        String projectId = uploadCalculatorProject();
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.getMethodContext(projectId, "Calculator", "doProtected",
+                        java.util.List.of()));
+        assertEquals(400, ex.getCode());
+    }
 }
