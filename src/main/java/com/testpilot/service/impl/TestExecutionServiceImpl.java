@@ -13,10 +13,15 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * 测试执行服务实现。
@@ -64,6 +69,10 @@ public class TestExecutionServiceImpl implements TestExecutionService {
         // 1. 定位 Maven 项目根目录（含 pom.xml）
         Path mavenDir = projectService.getMavenProjectDir(projectId);
 
+        // 1a. 清理旧的 Surefire 报告，避免上次执行结果污染本次
+        Path reportsDir = mavenDir.resolve("target").resolve("surefire-reports");
+        cleanSurefireReports(reportsDir, mavenDir);
+
         // 2. 执行固定的 Maven test 命令，不接受用户参数
         ProcessResult processResult = mavenProcessRunner.run(
                 mavenDir,
@@ -72,7 +81,6 @@ public class TestExecutionServiceImpl implements TestExecutionService {
                 maxLogLength);
 
         // 3. 解析 Surefire 报告
-        Path reportsDir = mavenDir.resolve("target").resolve("surefire-reports");
         SurefireReportParser.SurefireSummary summary = SurefireReportParser.parse(reportsDir);
 
         // 4. 综合判断状态
@@ -144,5 +152,38 @@ public class TestExecutionServiceImpl implements TestExecutionService {
                 processResult.getExecutionTimeMs(),
                 output,
                 errorMessage);
+    }
+
+    /**
+     * 清理 Surefire 报告目录，避免旧报告污染本次执行结果。
+     * <p>
+     * 安全约束：只删除 reportsDir 下的内容，且所有路径必须在 mavenDir 内。
+     * 不跟随符号链接（不删除符号链接指向的外部文件）。
+     */
+    private void cleanSurefireReports(Path reportsDir, Path mavenDir) {
+        if (!Files.isDirectory(reportsDir)) {
+            return;
+        }
+        Path normalizedMaven = mavenDir.normalize();
+        try (Stream<Path> stream = Files.walk(reportsDir)) {
+            // 先删除文件，再删除目录（逆序）
+            List<Path> paths = stream
+                    .filter(p -> p.normalize().startsWith(normalizedMaven))
+                    .sorted(Comparator.reverseOrder())
+                    .toList();
+            for (Path p : paths) {
+                // 不删除符号链接指向的目标，只删除链接本身
+                if (Files.isSymbolicLink(p) || p.equals(reportsDir)) {
+                    continue;
+                }
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException e) {
+                    log.warn("清理 Surefire 报告文件失败: {}", p, e);
+                }
+            }
+        } catch (IOException e) {
+            log.warn("遍历 Surefire 报告目录失败: {}", reportsDir, e);
+        }
     }
 }

@@ -187,6 +187,97 @@ public final class PromptBuilder {
     }
 
     /**
+     * 增强修复代码校验：
+     * 1. 测试类名必须为 {expectedClassName}Test。
+     * 2. 修复后 @Test 方法数量不得少于修复前（防止删除测试场景）。
+     * 3. 不允许使用 @Disabled / @Ignore 等跳过注解。
+     * 4. 必须包含断言方法（assert*）。
+     * 5. 基础校验（package/class/@Test/import）仍需通过。
+     *
+     * @return null 表示校验通过，否则返回错误描述
+     */
+    public static String validateRepairedCode(String originalCode, String repairedCode,
+                                               String expectedClassName, String expectedPackage,
+                                               JUnitVersion version) {
+        // 基础校验
+        String baseError = validateGeneratedCode(repairedCode, expectedPackage, version);
+        if (baseError != null) {
+            return baseError;
+        }
+
+        // 1. 测试类名校验
+        String expectedTestClass = expectedClassName + "Test";
+        // 匹配 class XxxTest 声明（允许 public / 普通 / final / abstract 等修饰符）
+        java.util.regex.Pattern classPattern = java.util.regex.Pattern.compile(
+                "\\bclass\\s+" + java.util.regex.Pattern.quote(expectedTestClass) + "\\b");
+        if (!classPattern.matcher(repairedCode).find()) {
+            return "修复后的测试类名必须为 " + expectedTestClass;
+        }
+
+        // 2. @Test 方法数量对比
+        int originalTestCount = countTestMethods(originalCode);
+        int repairedTestCount = countTestMethods(repairedCode);
+        if (repairedTestCount < originalTestCount) {
+            return "修复后测试方法数量(" + repairedTestCount + ")少于修复前(" + originalTestCount + ")，不允许删除测试场景";
+        }
+        if (repairedTestCount == 0) {
+            return "修复后的代码没有任何 @Test 方法";
+        }
+
+        // 3. 跳过注解校验
+        if (containsSkipAnnotation(repairedCode)) {
+            return "修复后的代码包含 @Disabled / @Ignore 等跳过注解，不允许跳过失败测试";
+        }
+
+        // 4. 断言校验
+        if (!containsAssertion(repairedCode)) {
+            return "修复后的代码未包含任何断言方法（assert*），测试无效";
+        }
+
+        return null;
+    }
+
+    /**
+     * 统计代码中 @Test 注解的数量（粗略统计，不做完整语法解析）。
+     */
+    public static int countTestMethods(String code) {
+        if (code == null || code.isBlank()) {
+            return 0;
+        }
+        int count = 0;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("@Test\\b").matcher(code);
+        while (m.find()) {
+            count++;
+        }
+        return count;
+    }
+
+    /**
+     * 检测代码中是否包含跳过测试的注解（@Disabled、@Ignore）。
+     */
+    public static boolean containsSkipAnnotation(String code) {
+        if (code == null || code.isBlank()) {
+            return false;
+        }
+        return code.contains("@Disabled") || code.contains("@Ignore");
+    }
+
+    /**
+     * 检测代码中是否包含断言调用。
+     * JUnit 4: org.junit.Assert.assert* 或 Assert.assert*
+     * JUnit 5: org.junit.jupiter.api.Assertions.assert* 或 Assertions.assert*
+     */
+    public static boolean containsAssertion(String code) {
+        if (code == null || code.isBlank()) {
+            return false;
+        }
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                "\\bAssert(ions)?\\.assert|org\\.junit\\.jupiter\\.api\\.Assertions\\.assert|"
+                        + "org\\.junit\\.Assert\\.assert");
+        return p.matcher(code).find();
+    }
+
+    /**
      * 计算参数类型的简洁字符串表示（用于方法签名）。
      */
     public static String parameterSignature(MethodParameter p) {

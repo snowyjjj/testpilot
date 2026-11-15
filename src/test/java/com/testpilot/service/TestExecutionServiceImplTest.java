@@ -53,12 +53,25 @@ class TestExecutionServiceImplTest {
         Files.writeString(reportsDir.resolve("com.example.CalculatorTest.txt"), content, StandardCharsets.UTF_8);
     }
 
+    /**
+     * 模拟 Maven 执行：在 run() 被调用时写入 surefire 报告（模拟执行过程中生成报告），
+     * 因为 executeTests 会在执行前清理旧报告。
+     */
+    private Answer<ProcessResult> runWithReport(ProcessResult result, String reportContent) {
+        return invocation -> {
+            Path mavenDir = invocation.getArgument(0);
+            writeSurefireReport(mavenDir, reportContent);
+            return result;
+        };
+    }
+
     @Test
     void executeTests_success_passedStatus() throws IOException {
         when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
         when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
-                .thenReturn(new ProcessResult(0, "BUILD SUCCESS", "", false, 1200L));
-        writeSurefireReport(tempDir, "Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
+                .thenAnswer(runWithReport(
+                        new ProcessResult(0, "BUILD SUCCESS", "", false, 1200L),
+                        "Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n"));
 
         TestExecutionResult result = service.executeTests("p1");
 
@@ -75,8 +88,9 @@ class TestExecutionServiceImplTest {
     void executeTests_testFailure_failedStatus() throws IOException {
         when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
         when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
-                .thenReturn(new ProcessResult(1, "BUILD FAILURE", "", false, 1500L));
-        writeSurefireReport(tempDir, "Tests run: 5, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
+                .thenAnswer(runWithReport(
+                        new ProcessResult(1, "BUILD FAILURE", "", false, 1500L),
+                        "Tests run: 5, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n"));
 
         TestExecutionResult result = service.executeTests("p1");
 
@@ -131,8 +145,9 @@ class TestExecutionServiceImplTest {
         when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
         String hugeOutput = "x".repeat(100000);
         when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
-                .thenReturn(new ProcessResult(0, hugeOutput, "", false, 100L));
-        writeSurefireReport(tempDir, "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
+                .thenAnswer(runWithReport(
+                        new ProcessResult(0, hugeOutput, "", false, 100L),
+                        "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n"));
 
         TestExecutionResult result = service.executeTests("p1");
 
@@ -218,5 +233,27 @@ class TestExecutionServiceImplTest {
         BusinessException ex = assertThrows(BusinessException.class, () -> service.executeTests("  "));
         assertEquals(400, ex.getCode());
         verify(processRunner, never()).run(any(), any(), any(), anyInt());
+    }
+
+    // 旧 Surefire 报告不会污染本次执行结果
+    @Test
+    void executeTests_staleReportsDoNotPolluteNewResult() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        // 预先写入旧报告（大量失败）
+        writeSurefireReport(tempDir, "Tests run: 10, Failures: 8, Errors: 1, Skipped: 1, Time elapsed: 0.1 sec\n");
+
+        // 本次执行只生成 4 通过的新报告
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(runWithReport(
+                        new ProcessResult(0, "BUILD SUCCESS", "", false, 500L),
+                        "Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n"));
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        assertTrue(result.isSuccess());
+        assertEquals("PASSED", result.getStatus());
+        assertEquals(4, result.getTotalTests());
+        assertEquals(4, result.getPassedTests());
+        assertEquals(0, result.getFailedTests());
     }
 }

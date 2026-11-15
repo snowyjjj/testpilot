@@ -1,5 +1,6 @@
 package com.testpilot.service;
 
+import com.testpilot.common.exception.BusinessException;
 import com.testpilot.dto.JUnitVersion;
 import com.testpilot.dto.MethodContext;
 import com.testpilot.dto.MethodInfo;
@@ -341,5 +342,148 @@ class TestOptimizationServiceImplTest {
         optimizationService.optimize("pid", buildRequest());
 
         assertEquals(sourceContent, Files.readString(sourceFile, StandardCharsets.UTF_8));
+    }
+
+    // 13. 修复后再次执行 TIMEOUT：立即停止后续 LLM 修复，并恢复本轮修改前的测试代码
+    @Test
+    void optimize_repairedThenTimeout_stopsAndRestores() throws IOException {
+        setupCommonMocks();
+        Path testFile = writeExistingTest(validJUnit4Test());
+        String original = validJUnit4Test();
+
+        // 初次 FAILED -> 修复 -> 再次执行 TIMEOUT
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(result("FAILED", false, 1, 1, ""))
+                .thenReturn(result("TIMEOUT", false, -1, 0, ""));
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        assertFalse(r.isOptimizationSuccess());
+        assertEquals(1, r.getRetryCount());
+        // TIMEOUT 后不再调用 LLM
+        verify(llmService, times(1)).chat(anyString());
+        // 测试代码应被恢复为原始版本
+        assertEquals(original, Files.readString(testFile, StandardCharsets.UTF_8));
+    }
+
+    // 14. 修复后再次执行 MAVEN_ERROR：立即停止并恢复代码
+    @Test
+    void optimize_repairedThenMavenError_stopsAndRestores() throws IOException {
+        setupCommonMocks();
+        Path testFile = writeExistingTest(validJUnit4Test());
+        String original = validJUnit4Test();
+
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(result("FAILED", false, 1, 1, ""))
+                .thenReturn(result("MAVEN_ERROR", false, -1, 0, "mvn not found"));
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        assertFalse(r.isOptimizationSuccess());
+        assertEquals(1, r.getRetryCount());
+        verify(llmService, times(1)).chat(anyString());
+        assertEquals(original, Files.readString(testFile, StandardCharsets.UTF_8));
+    }
+
+    // 15. 修复后再次执行 NO_REPORTS：立即停止并恢复代码
+    @Test
+    void optimize_repairedThenNoReports_stopsAndRestores() throws IOException {
+        setupCommonMocks();
+        Path testFile = writeExistingTest(validJUnit4Test());
+        String original = validJUnit4Test();
+
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(result("FAILED", false, 1, 1, ""))
+                .thenReturn(result("NO_REPORTS", false, 0, 0, ""));
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        assertFalse(r.isOptimizationSuccess());
+        assertEquals(1, r.getRetryCount());
+        verify(llmService, times(1)).chat(anyString());
+        assertEquals(original, Files.readString(testFile, StandardCharsets.UTF_8));
+    }
+
+    // 16. 主源码编译失败不调用 LLM
+    @Test
+    void optimize_mainSourceCompileError_doesNotCallLLM() throws IOException {
+        setupCommonMocks();
+        writeExistingTest(validJUnit4Test());
+        // 错误来自 src/main/java 下的业务源码
+        TestExecutionResult mainCompileError = result("COMPILE_ERROR", false, 1, 0,
+                "[ERROR] /x/src/main/java/com/example/Calculator.java:[5,8] ';' expected");
+        when(testExecutionService.executeTests(anyString())).thenReturn(mainCompileError);
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        assertFalse(r.isOptimizationSuccess());
+        assertEquals(0, r.getRetryCount());
+        verify(llmService, never()).chat(anyString());
+    }
+
+    // 17. 并发优化锁：同一 projectId 同时只能有一个优化流程
+    @Test
+    void optimize_concurrentSameProject_rejected() throws Exception {
+        setupCommonMocks();
+        writeExistingTest(validJUnit4Test());
+        // 让第一次执行阻塞，第二次被拒绝
+        when(testExecutionService.executeTests(anyString()))
+                .thenAnswer(invocation -> {
+                    Thread.sleep(300);
+                    return result("PASSED", true, 0, 0, "");
+                });
+
+        Thread t1 = new Thread(() -> optimizationService.optimize("pid", buildRequest()));
+        t1.start();
+        Thread.sleep(100);
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> optimizationService.optimize("pid", buildRequest()));
+        assertEquals(409, ex.getCode());
+
+        t1.join();
+    }
+
+    // 18. validateRepairedCode：修复后删除测试方法应被拒绝
+    @Test
+    void validateRepairedCode_removesTestMethod_rejected() {
+        String original = validJUnit4Test()
+                + "  @Test\n  public void testSub() { Assert.assertEquals(1, c.sub(3, 2)); }\n";
+        String repaired = validJUnit4Test(); // 少了一个 @Test 方法
+
+        String error = PromptBuilder.validateRepairedCode(
+                original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
+
+        assertNotNull(error);
+        assertTrue(error.contains("测试方法") || error.contains("减少") || error.contains("@Test"));
+    }
+
+    // 19. validateRepairedCode：添加 @Disabled 跳过注解应被拒绝
+    @Test
+    void validateRepairedCode_addsDisabled_rejected() {
+        String original = validJUnit4Test();
+        String repaired = validJUnit4Test().replace("@Test", "@Disabled\n  @Test");
+
+        String error = PromptBuilder.validateRepairedCode(
+                original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
+
+        assertNotNull(error);
+        assertTrue(error.contains("Disabled") || error.contains("跳过") || error.contains("Ignore"));
+    }
+
+    // 20. validateRepairedCode：添加 @Ignore 跳过注解应被拒绝
+    @Test
+    void validateRepairedCode_addsIgnore_rejected() {
+        String original = validJUnit4Test();
+        String repaired = validJUnit4Test().replace("@Test", "@Ignore\n  @Test");
+
+        String error = PromptBuilder.validateRepairedCode(
+                original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
+
+        assertNotNull(error);
+        assertTrue(error.contains("Disabled") || error.contains("跳过") || error.contains("Ignore"));
     }
 }

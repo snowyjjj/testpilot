@@ -2,6 +2,7 @@ package com.testpilot.service.impl;
 
 import com.testpilot.common.exception.BusinessException;
 import com.testpilot.dto.FailureFeedback;
+import com.testpilot.dto.FailureFeedback.CompileErrorSource;
 import com.testpilot.dto.JUnitVersion;
 import com.testpilot.dto.MethodContext;
 import com.testpilot.dto.RepairRecord;
@@ -23,6 +24,8 @@ import org.springframework.stereotype.Service;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 测试优化服务实现：执行 → 失败反馈 → LLM 修复 → 重新执行 的有限轮次闭环。
@@ -41,6 +44,9 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
     private final TestExecutionService testExecutionService;
     private final LLMService llmService;
 
+    /** 正在优化的项目集合，防止同一项目并发修改测试文件 */
+    private final Set<String> optimizingProjects = ConcurrentHashMap.newKeySet();
+
     @Override
     public TestOptimizationResult optimize(String projectId, TestOptimizationRequest request) {
         if (projectId == null || projectId.isBlank()) {
@@ -50,6 +56,19 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
             throw new BusinessException(400, "请求体不能为空");
         }
 
+        // 并发控制：同一项目不允许同时优化
+        if (!optimizingProjects.add(projectId)) {
+            throw new BusinessException(409, "该项目正在执行测试优化，请稍后重试");
+        }
+
+        try {
+            return doOptimize(projectId, request);
+        } finally {
+            optimizingProjects.remove(projectId);
+        }
+    }
+
+    private TestOptimizationResult doOptimize(String projectId, TestOptimizationRequest request) {
         int maxRetries = request.getMaxRetries() != null ? request.getMaxRetries() : DEFAULT_MAX_RETRIES;
         if (maxRetries < 0) {
             maxRetries = 0;
@@ -75,6 +94,7 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
         if (currentTestCode == null) {
             throw new BusinessException(404, "未找到已生成的测试文件，请先生成测试");
         }
+        String testFileName = testFilePath.getFileName().toString();
 
         // 4. 获取 Maven 项目根目录（用于定位 surefire 报告）
         Path mavenDir = projectService.getMavenProjectDir(projectId);
@@ -95,6 +115,16 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
             return new TestOptimizationResult(projectId, initialResult, 0, false, initialResult, records);
         }
 
+        // 初始编译错误需判断来源
+        if ("COMPILE_ERROR".equals(initialResult.getStatus())) {
+            FailureFeedback initialFeedback = ExecutionFeedbackExtractor.extract(initialResult, surefireDir, testFileName);
+            if (initialFeedback != null && initialFeedback.getCompileErrorSource() != CompileErrorSource.TEST_SOURCE) {
+                log.info("初始编译错误来源为 {}，非测试源码错误，不进入修复流程",
+                        initialFeedback.getCompileErrorSource());
+                return new TestOptimizationResult(projectId, initialResult, 0, false, initialResult, records);
+            }
+        }
+
         // 6. 修复循环
         TestExecutionResult lastResult = initialResult;
         int retryCount = 0;
@@ -105,7 +135,18 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
             log.info("开始第 {} 轮修复, projectId={}", retry, projectId);
 
             // 6a. 提取失败反馈
-            FailureFeedback feedback = ExecutionFeedbackExtractor.extract(lastResult, surefireDir);
+            FailureFeedback feedback = ExecutionFeedbackExtractor.extract(lastResult, surefireDir, testFileName);
+
+            // 编译错误来源校验：只有 TEST_SOURCE 才允许 LLM 修复
+            if (feedback != null && feedback.getFailureType() == FailureFeedback.FailureType.COMPILE
+                    && feedback.getCompileErrorSource() != CompileErrorSource.TEST_SOURCE) {
+                log.info("第 {} 轮编译错误来源为 {}，停止修复", retry, feedback.getCompileErrorSource());
+                records.add(new RepairRecord(retry,
+                        feedback.getFailureType().name(),
+                        feedback.getSummary() + "（非测试源码错误，不允许自动修复）",
+                        false, lastResult));
+                break;
+            }
 
             // 6b. 构建修复 Prompt
             String prompt = PromptBuilder.buildRepairPrompt(ctx, junitVersion, currentTestCode, feedback, retry);
@@ -123,15 +164,15 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
                 break;
             }
 
-            // 6d. 提取 + 校验代码
+            // 6d. 提取 + 增强校验代码
             String repairedCode = PromptBuilder.extractJavaCode(response);
-            String validationError = PromptBuilder.validateGeneratedCode(
-                    repairedCode, ctx.getPackageName(), junitVersion);
+            String validationError = PromptBuilder.validateRepairedCode(
+                    currentTestCode, repairedCode, ctx.getClassName(), ctx.getPackageName(), junitVersion);
             if (validationError != null) {
                 log.warn("修复代码校验失败: {}", validationError);
                 records.add(new RepairRecord(retry,
                         feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
-                        feedback != null ? feedback.getSummary() : "代码校验失败: " + validationError,
+                        "代码校验失败: " + validationError,
                         false, lastResult));
                 // 校验失败不更新文件，继续下一轮或结束
                 continue;
@@ -140,14 +181,12 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
             // 6e. 备份并更新测试文件
             String backupCode = currentTestCode;
             try {
-                String original = TestFileManager.updateTestFile(projectDir, testFilePath, repairedCode);
-                // 更新成功后，currentTestCode 指向新代码
+                TestFileManager.updateTestFile(projectDir, testFilePath, repairedCode);
                 currentTestCode = repairedCode;
                 log.info("第 {} 轮修复代码已保存", retry);
             } catch (Exception e) {
                 log.error("保存修复代码失败", e);
-                // 恢复原始代码
-                TestFileManager.restoreTestFile(testFilePath, backupCode);
+                TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
                 records.add(new RepairRecord(retry,
                         feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
                         "保存修复代码失败: " + e.getMessage(),
@@ -161,8 +200,7 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
                 retryResult = testExecutionService.executeTests(projectId);
             } catch (Exception e) {
                 log.error("修复后重新执行失败", e);
-                // 恢复原始代码
-                TestFileManager.restoreTestFile(testFilePath, backupCode);
+                TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
                 records.add(new RepairRecord(retry,
                         feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
                         "重新执行失败: " + e.getMessage(),
@@ -170,20 +208,50 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
                 break;
             }
 
-            lastResult = retryResult;
-            boolean repaired = "PASSED".equals(retryResult.getStatus());
-            records.add(new RepairRecord(retry,
-                    feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
-                    feedback != null ? feedback.getSummary() : "",
-                    true, retryResult));
-
-            if (repaired) {
+            // 6g. 根据重新执行结果决定下一步
+            String retryStatus = retryResult.getStatus();
+            if ("PASSED".equals(retryStatus)) {
                 success = true;
+                records.add(new RepairRecord(retry,
+                        feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
+                        feedback != null ? feedback.getSummary() : "",
+                        true, retryResult));
                 log.info("第 {} 轮修复成功", retry);
                 break;
             }
 
-            // 仍失败，继续下一轮
+            if ("COMPILE_ERROR".equals(retryStatus) || "FAILED".equals(retryStatus)) {
+                // 仍为可修复状态，检查编译错误来源
+                if ("COMPILE_ERROR".equals(retryStatus)) {
+                    FailureFeedback retryFeedback = ExecutionFeedbackExtractor.extract(retryResult, surefireDir, testFileName);
+                    if (retryFeedback != null && retryFeedback.getCompileErrorSource() != CompileErrorSource.TEST_SOURCE) {
+                        log.info("第 {} 轮修复后编译错误来源为 {}，停止修复", retry, retryFeedback.getCompileErrorSource());
+                        records.add(new RepairRecord(retry,
+                                feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
+                                retryFeedback.getSummary() + "（非测试源码错误，不允许继续修复）",
+                                true, retryResult));
+                        break;
+                    }
+                }
+                // 记录本轮结果，继续下一轮
+                records.add(new RepairRecord(retry,
+                        feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
+                        feedback != null ? feedback.getSummary() : "",
+                        true, retryResult));
+                lastResult = retryResult;
+                continue;
+            }
+
+            // TIMEOUT / MAVEN_ERROR / NO_REPORTS：环境问题，立即停止并恢复本轮修改前的代码
+            log.info("第 {} 轮修复后执行状态为 {}，停止修复并恢复测试代码", retry, retryStatus);
+            TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
+            currentTestCode = backupCode;
+            records.add(new RepairRecord(retry,
+                    feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
+                    "执行状态为 " + retryStatus + "，停止修复并已恢复测试代码",
+                    true, retryResult));
+            lastResult = retryResult;
+            break;
         }
 
         return new TestOptimizationResult(projectId, initialResult, retryCount, success, lastResult, records);
