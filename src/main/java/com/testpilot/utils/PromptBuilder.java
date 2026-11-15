@@ -1,9 +1,12 @@
 package com.testpilot.utils;
 
+import com.testpilot.dto.FailureFeedback;
+import com.testpilot.dto.FailureFeedback.FailedCaseInfo;
 import com.testpilot.dto.JUnitVersion;
 import com.testpilot.dto.MethodContext;
 import com.testpilot.dto.MethodParameter;
 
+import java.nio.file.Path;
 import java.util.stream.Collectors;
 
 /**
@@ -12,6 +15,39 @@ import java.util.stream.Collectors;
 public final class PromptBuilder {
 
     private PromptBuilder() {
+    }
+
+    /**
+     * 根据被测源文件的相对路径推导测试文件路径。
+     * 例如：src/main/java/com/example/Calculator.java → src/test/java/com/example/CalculatorTest.java
+     * 兼容 ZIP 内存在单层子目录的情况。
+     * 返回相对于 projectDir 解析并 normalize 后的路径，并做边界校验。
+     */
+    public static Path resolveTestFilePath(Path projectDir, MethodContext ctx) {
+        String sourceRelative = ctx.getSourceFilePath();
+        String normalized = sourceRelative.replace("\\", "/");
+
+        int markerIdx = normalized.indexOf("src/main/java");
+        String testRelative;
+        if (markerIdx >= 0) {
+            testRelative = normalized.substring(0, markerIdx)
+                    + "src/test/java"
+                    + normalized.substring(markerIdx + "src/main/java".length());
+        } else {
+            int lastSlash = normalized.lastIndexOf('/');
+            String dir = lastSlash >= 0 ? normalized.substring(0, lastSlash) : "";
+            String file = lastSlash >= 0 ? normalized.substring(lastSlash + 1) : normalized;
+            testRelative = (dir.isEmpty() ? "" : dir + "/") + file;
+        }
+
+        String className = ctx.getClassName();
+        testRelative = testRelative.replace(className + ".java", className + "Test.java");
+
+        Path resolved = projectDir.resolve(testRelative).normalize();
+        if (!resolved.startsWith(projectDir)) {
+            throw new IllegalStateException("测试文件路径越界: " + testRelative);
+        }
+        return resolved;
     }
 
     /**
@@ -155,5 +191,81 @@ public final class PromptBuilder {
      */
     public static String parameterSignature(MethodParameter p) {
         return p.getType();
+    }
+
+    /**
+     * 构建测试修复 Prompt。将当前测试代码、被测源码、JUnit 版本、失败反馈和修复轮次提供给 LLM。
+     */
+    public static String buildRepairPrompt(MethodContext ctx, JUnitVersion version,
+                                           String currentTestCode, FailureFeedback feedback,
+                                           int retryNumber) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一名 Java 单元测试修复专家。以下测试代码编译失败或执行失败，请根据反馈信息修复。\n\n");
+
+        sb.append("【当前修复轮次】\n第 ").append(retryNumber).append(" 轮修复\n\n");
+
+        sb.append("【包名】\n").append(ctx.getPackageName().isBlank() ? "(默认包)" : ctx.getPackageName()).append("\n\n");
+        sb.append("【被测类名】\n").append(ctx.getClassName()).append("\n\n");
+        sb.append("【被测类完整源码】\n```java\n").append(ctx.getClassSource()).append("\n```\n\n");
+        sb.append("【被测方法源码】\n```java\n").append(ctx.getMethodInfo().getSource()).append("\n```\n\n");
+
+        sb.append("【当前 JUnit 版本】\n");
+        if (version == JUnitVersion.JUNIT4) {
+            sb.append("JUnit 4（org.junit.Test + org.junit.Assert）\n\n");
+        } else if (version == JUnitVersion.JUNIT5) {
+            sb.append("JUnit 5（org.junit.jupiter.api.Test + org.junit.jupiter.api.Assertions）\n\n");
+        } else {
+            sb.append("未知（默认使用 JUnit 4 语法）\n\n");
+        }
+
+        sb.append("【当前测试代码】\n```java\n").append(currentTestCode).append("\n```\n\n");
+
+        sb.append("【失败反馈】\n");
+        if (feedback != null) {
+            sb.append("类型：").append(feedback.getFailureType() == FailureFeedback.FailureType.COMPILE
+                    ? "编译错误" : "测试执行失败").append("\n");
+            sb.append("摘要：").append(feedback.getSummary()).append("\n\n");
+            if (feedback.getFailureType() == FailureFeedback.FailureType.COMPILE) {
+                sb.append("编译错误详情：\n");
+                for (String err : feedback.getCompileErrors()) {
+                    sb.append("- ").append(err).append("\n");
+                }
+            } else {
+                sb.append("失败用例详情：\n");
+                for (FailedCaseInfo fc : feedback.getFailedCases()) {
+                    sb.append("- 类：").append(fc.getClassName())
+                            .append("，方法：").append(fc.getMethodName()).append("\n");
+                    sb.append("  异常类型：").append(fc.getExceptionType()).append("\n");
+                    if (fc.getMessage() != null && !fc.getMessage().isBlank()) {
+                        sb.append("  消息：").append(fc.getMessage()).append("\n");
+                    }
+                    if (fc.getStackTrace() != null && !fc.getStackTrace().isBlank()) {
+                        sb.append("  堆栈：\n").append(fc.getStackTrace()).append("\n");
+                    }
+                }
+            }
+        } else {
+            sb.append("(无详细反馈)\n");
+        }
+        sb.append("\n");
+
+        sb.append("【修复要求】\n");
+        sb.append("1. 只能修改测试代码，绝对不允许修改被测业务源码。\n");
+        sb.append("2. 不允许为了通过测试而删除原有测试场景或减少测试方法。\n");
+        sb.append("3. 不允许随意删除或弱化断言；修复必须针对实际的编译错误或测试失败原因。\n");
+        sb.append("4. 不允许使用 @Disabled、@Ignore 或其他方式跳过失败的测试。\n");
+        sb.append("5. 不允许编造不存在的类、方法、字段或依赖。\n");
+        sb.append("6. 保留已有的有效测试场景，只修复有问题的部分。\n");
+        sb.append("7. 不生成不存在的 import，不生成无用 import。\n");
+        sb.append("8. 断言必须与被测方法的实际行为一致。\n");
+        if (version == JUnitVersion.JUNIT4) {
+            sb.append("9. 继续使用 JUnit 4：org.junit.Test + org.junit.Assert，不使用 JUnit 5 专属 API。\n");
+        } else if (version == JUnitVersion.JUNIT5) {
+            sb.append("9. 继续使用 JUnit 5：org.junit.jupiter.api.Test + org.junit.jupiter.api.Assertions。\n");
+        }
+        sb.append("10. 测试类命名为 ").append(ctx.getClassName()).append("Test，放在与被测类相同的包下。\n");
+        sb.append("11. 只输出完整的 Java 源码，不要输出任何解释性文字。\n");
+
+        return sb.toString();
     }
 }

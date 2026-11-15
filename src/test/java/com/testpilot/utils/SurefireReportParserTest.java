@@ -80,4 +80,99 @@ class SurefireReportParserTest {
 
         assertFalse(summary.isReportFound());
     }
+
+    // ============ XML 失败用例解析测试 ============
+
+    @Test
+    void parseXmlFailures_extractsFailureCase() throws IOException {
+        String xml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <testsuite name="com.example.CalculatorTest" tests="2" failures="1" errors="0">
+                  <testcase classname="com.example.CalculatorTest" name="testAdd" time="0.001">
+                    <failure type="java.lang.AssertionError" message="expected:&lt;3&gt; but was:&lt;5&gt;">
+                java.lang.AssertionError: expected:&lt;3&gt; but was:&lt;5&gt;
+                    at com.example.CalculatorTest.testAdd(CalculatorTest.java:12)
+                    </failure>
+                  </testcase>
+                  <testcase classname="com.example.CalculatorTest" name="testSub" time="0.001"/>
+                </testsuite>
+                """;
+        Files.writeString(tempDir.resolve("TEST-com.example.CalculatorTest.xml"), xml, StandardCharsets.UTF_8);
+
+        var failures = SurefireReportParser.parseXmlFailures(tempDir, 500);
+
+        assertEquals(1, failures.size());
+        SurefireReportParser.FailedCase fc = failures.get(0);
+        assertEquals("com.example.CalculatorTest", fc.getClassName());
+        assertEquals("testAdd", fc.getMethodName());
+        assertEquals("java.lang.AssertionError", fc.getExceptionType());
+        assertTrue(fc.getMessage().contains("expected"));
+        assertTrue(fc.getStackTrace().contains("CalculatorTest.java:12"));
+    }
+
+    @Test
+    void parseXmlFailures_extractsErrorCase() throws IOException {
+        String xml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <testsuite name="com.example.CalculatorTest" tests="1" failures="0" errors="1">
+                  <testcase classname="com.example.CalculatorTest" name="testCrash" time="0.001">
+                    <error type="java.lang.NullPointerException" message="null"/>
+                  </testcase>
+                </testsuite>
+                """;
+        Files.writeString(tempDir.resolve("TEST-com.example.CalculatorTest.xml"), xml, StandardCharsets.UTF_8);
+
+        var failures = SurefireReportParser.parseXmlFailures(tempDir, 500);
+
+        assertEquals(1, failures.size());
+        assertEquals("java.lang.NullPointerException", failures.get(0).getExceptionType());
+    }
+
+    @Test
+    void parseXmlFailures_longStackTrace_isTruncated() throws IOException {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; i++) {
+            sb.append("at com.example.X.line(").append(i).append(")\n");
+        }
+        String xml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <testsuite tests="1" failures="1" errors="0">
+                  <testcase classname="C" name="m">
+                    <failure type="java.lang.AssertionError">%s</failure>
+                  </testcase>
+                </testsuite>
+                """.formatted(sb);
+        Files.writeString(tempDir.resolve("TEST-C.xml"), xml, StandardCharsets.UTF_8);
+
+        var failures = SurefireReportParser.parseXmlFailures(tempDir, 100);
+
+        assertEquals(1, failures.size());
+        // 截断后长度应 <= 限制 + 截断后缀长度
+        assertTrue(failures.get(0).getStackTrace().length() <= 100 + 30);
+        assertTrue(failures.get(0).getStackTrace().contains("truncated"));
+    }
+
+    @Test
+    void parseXmlFailures_xxeAttack_safe() throws IOException {
+        // 恶意 XXE XML：尝试读取外部实体
+        String xml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+                <testsuite tests="1" failures="1" errors="0">
+                  <testcase classname="C" name="m">
+                    <failure type="E">&xxe;</failure>
+                  </testcase>
+                </testsuite>
+                """;
+        Files.writeString(tempDir.resolve("TEST-C.xml"), xml, StandardCharsets.UTF_8);
+
+        // 解析应安全失败（空列表或抛异常被吞），不能加载外部实体
+        var failures = SurefireReportParser.parseXmlFailures(tempDir, 500);
+        assertTrue(failures.isEmpty());
+    }
+
+    @Test
+    void parseXmlFailures_noXmlFiles_returnsEmpty() {
+        assertTrue(SurefireReportParser.parseXmlFailures(tempDir, 500).isEmpty());
+    }
 }
