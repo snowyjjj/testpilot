@@ -186,10 +186,11 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
                 log.info("第 {} 轮修复代码已保存", retry);
             } catch (Exception e) {
                 log.error("保存修复代码失败", e);
-                TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
+                boolean restored = TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
                 records.add(new RepairRecord(retry,
                         feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
-                        "保存修复代码失败: " + e.getMessage(),
+                        "保存修复代码失败: " + e.getMessage()
+                                + (restored ? "，已恢复原始代码" : "，且恢复原始代码失败"),
                         false, lastResult));
                 break;
             }
@@ -200,11 +201,12 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
                 retryResult = testExecutionService.executeTests(projectId);
             } catch (Exception e) {
                 log.error("修复后重新执行失败", e);
-                TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
+                boolean restored = TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
                 records.add(new RepairRecord(retry,
                         feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
-                        "重新执行失败: " + e.getMessage(),
-                        true, lastResult));
+                        "重新执行失败: " + e.getMessage()
+                                + (restored ? "，已恢复原始代码" : "，且恢复原始代码失败"),
+                        restored, lastResult));
                 break;
             }
 
@@ -225,11 +227,19 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
                 if ("COMPILE_ERROR".equals(retryStatus)) {
                     FailureFeedback retryFeedback = ExecutionFeedbackExtractor.extract(retryResult, surefireDir, testFileName);
                     if (retryFeedback != null && retryFeedback.getCompileErrorSource() != CompileErrorSource.TEST_SOURCE) {
-                        log.info("第 {} 轮修复后编译错误来源为 {}，停止修复", retry, retryFeedback.getCompileErrorSource());
+                        log.info("第 {} 轮修复后编译错误来源为 {}，停止修复并恢复测试代码", retry, retryFeedback.getCompileErrorSource());
+                        // 恢复本轮修复前的测试代码
+                        boolean restored = TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
+                        if (restored) {
+                            currentTestCode = backupCode;
+                        }
+                        String summary = retryFeedback.getSummary() + "（非测试源码错误，不允许继续修复）"
+                                + (restored ? "，已恢复测试代码" : "，但恢复测试代码失败");
                         records.add(new RepairRecord(retry,
                                 feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
-                                retryFeedback.getSummary() + "（非测试源码错误，不允许继续修复）",
-                                true, retryResult));
+                                summary,
+                                restored, retryResult));
+                        lastResult = retryResult;
                         break;
                     }
                 }
@@ -244,12 +254,16 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
 
             // TIMEOUT / MAVEN_ERROR / NO_REPORTS：环境问题，立即停止并恢复本轮修改前的代码
             log.info("第 {} 轮修复后执行状态为 {}，停止修复并恢复测试代码", retry, retryStatus);
-            TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
-            currentTestCode = backupCode;
+            boolean restored = TestFileManager.restoreTestFile(projectDir, testFilePath, backupCode);
+            if (restored) {
+                currentTestCode = backupCode;
+            }
+            String summary = "执行状态为 " + retryStatus + "，停止修复"
+                    + (restored ? "，已恢复测试代码" : "，但恢复测试代码失败");
             records.add(new RepairRecord(retry,
                     feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
-                    "执行状态为 " + retryStatus + "，停止修复并已恢复测试代码",
-                    true, retryResult));
+                    summary,
+                    restored, retryResult));
             lastResult = retryResult;
             break;
         }

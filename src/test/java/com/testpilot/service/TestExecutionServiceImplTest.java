@@ -8,6 +8,8 @@ import com.testpilot.utils.ProcessResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import org.mockito.stubbing.Answer;
 
 import java.io.IOException;
@@ -138,6 +140,8 @@ class TestExecutionServiceImplTest {
         // 构建成功但无报告
         assertEquals("NO_REPORTS", result.getStatus());
         assertEquals(0, result.getTotalTests());
+        // NO_REPORTS 不能视为测试通过
+        assertFalse(result.isSuccess(), "没有测试报告不应视为测试通过");
     }
 
     @Test
@@ -255,5 +259,27 @@ class TestExecutionServiceImplTest {
         assertEquals(4, result.getTotalTests());
         assertEquals(4, result.getPassedTests());
         assertEquals(0, result.getFailedTests());
+    }
+
+    // Surefire 报告清理失败时，不允许继续执行 Maven
+    @Test
+    void executeTests_cleanupFailure_stopsExecution() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+
+        Path reportsDir = tempDir.resolve("target").resolve("surefire-reports");
+        Files.createDirectories(reportsDir);
+        Files.writeString(reportsDir.resolve("stale-report.txt"), "Tests run: 10, Failures: 8");
+
+        // 模拟 Files.deleteIfExists 抛出 IOException，模拟清理失败
+        try (MockedStatic<Files> filesMock = Mockito.mockStatic(Files.class, Mockito.CALLS_REAL_METHODS)) {
+            filesMock.when(() -> Files.deleteIfExists(any(Path.class)))
+                    .thenThrow(new IOException("模拟清理失败"));
+
+            TestExecutionResult result = service.executeTests("p1");
+
+            // 清理失败应返回 MAVEN_ERROR，且不执行 Maven
+            assertEquals("MAVEN_ERROR", result.getStatus());
+            verify(processRunner, never()).run(any(), any(), any(), anyInt());
+        }
     }
 }

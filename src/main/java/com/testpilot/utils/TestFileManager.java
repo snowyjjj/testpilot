@@ -88,28 +88,37 @@ public final class TestFileManager {
 
     /**
      * 恢复测试文件到指定内容（异常回滚时使用）。
-     * 恢复前也做路径边界校验。
+     * 恢复前也做路径边界校验，使用临时文件 + 原子移动。
+     *
+     * @return true 表示恢复成功，false 表示恢复失败（调用方不应声称已恢复）
      */
-    public static void restoreTestFile(Path projectDir, Path testFilePath, String originalCode) {
-        if (originalCode == null) {
-            // 原始不存在则删除
-            try {
-                assertPathWithinProject(projectDir, testFilePath);
-                Files.deleteIfExists(testFilePath);
-            } catch (IOException e) {
-                log.warn("恢复测试文件失败（删除）: {}", testFilePath, e);
-            }
-            return;
-        }
+    public static boolean restoreTestFile(Path projectDir, Path testFilePath, String originalCode) {
         try {
             assertPathWithinProject(projectDir, testFilePath);
+            if (originalCode == null) {
+                // 原始不存在则删除
+                Files.deleteIfExists(testFilePath);
+                return true;
+            }
             Path parent = testFilePath.getParent();
             if (parent != null) {
                 Files.createDirectories(parent);
             }
-            Files.writeString(testFilePath, originalCode, StandardCharsets.UTF_8);
+            Path tempFile = Files.createTempFile(parent, ".restore-", ".tmp");
+            try {
+                Files.writeString(tempFile, originalCode, StandardCharsets.UTF_8);
+                Files.move(tempFile, testFilePath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } finally {
+                if (Files.exists(tempFile)) {
+                    Files.deleteIfExists(tempFile);
+                }
+            }
+            // 移动后再次校验目标文件真实路径仍在项目内
+            assertPathWithinProject(projectDir, testFilePath);
+            return true;
         } catch (IOException e) {
             log.error("恢复测试文件失败: {}", testFilePath, e);
+            return false;
         }
     }
 
@@ -125,6 +134,11 @@ public final class TestFileManager {
     public static void assertPathWithinProject(Path projectDir, Path target) throws IOException {
         Path normalizedProject = projectDir.toAbsolutePath().normalize();
         Path normalizedTarget = target.toAbsolutePath().normalize();
+
+        // 0. 检查项目根目录自身是否为符号链接（若项目根是符号链接，所有边界检查都可能被绕过）
+        if (Files.isSymbolicLink(normalizedProject)) {
+            throw new IOException("项目根目录是符号链接，存在安全风险: " + projectDir);
+        }
 
         // 1. 规范化路径前缀检查（避免 toRealPath 与 normalize 字符串差异导致误判）
         if (!normalizedTarget.startsWith(normalizedProject)) {

@@ -60,9 +60,50 @@ class TestFileManagerTest {
         Files.createDirectories(testFile.getParent());
         Files.writeString(testFile, "modified");
 
-        TestFileManager.restoreTestFile(projectDir, testFile, "original");
+        boolean restored = TestFileManager.restoreTestFile(projectDir, testFile, "original");
 
+        assertTrue(restored, "restoreTestFile 应返回 true 表示恢复成功");
         assertEquals("original", Files.readString(testFile));
+    }
+
+    // restoreTestFile 当 originalCode 为 null 时删除文件并返回 true
+    @Test
+    void restoreTestFile_nullCode_deletesFile() throws IOException {
+        Path projectDir = tempDir.resolve("project");
+        Files.createDirectories(projectDir);
+        Path testFile = projectDir.resolve("src/test/java/com/example/CalculatorTest.java");
+        Files.createDirectories(testFile.getParent());
+        Files.writeString(testFile, "modified");
+
+        boolean restored = TestFileManager.restoreTestFile(projectDir, testFile, null);
+
+        assertTrue(restored, "删除文件应返回 true");
+        assertFalse(Files.exists(testFile), "原文件应被删除");
+    }
+
+    // 项目根目录自身是符号链接时应被拒绝
+    @Test
+    void assertPathWithinProject_projectRootSymlink_rejected() throws IOException {
+        Path realProjectDir = tempDir.resolve("realProject");
+        Files.createDirectories(realProjectDir);
+
+        // 创建一个指向 realProjectDir 的符号链接作为 projectDir
+        Path projectDir = tempDir.resolve("projectLink");
+        boolean symlinkSupported;
+        try {
+            Files.createSymbolicLink(projectDir, realProjectDir);
+            symlinkSupported = Files.isSymbolicLink(projectDir);
+        } catch (IOException | UnsupportedOperationException e) {
+            symlinkSupported = false;
+        }
+        org.junit.jupiter.api.Assumptions.assumeTrue(symlinkSupported,
+                "当前环境无法检测符号链接，跳过项目根目录符号链接测试");
+
+        Path testFile = projectDir.resolve("src/test/java/CalculatorTest.java");
+
+        IOException ex = assertThrows(IOException.class,
+                () -> TestFileManager.assertPathWithinProject(projectDir, testFile));
+        assertTrue(ex.getMessage().contains("项目根目录") || ex.getMessage().contains("符号链接"));
     }
 
     /**

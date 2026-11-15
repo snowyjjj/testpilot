@@ -71,7 +71,14 @@ public class TestExecutionServiceImpl implements TestExecutionService {
 
         // 1a. 清理旧的 Surefire 报告，避免上次执行结果污染本次
         Path reportsDir = mavenDir.resolve("target").resolve("surefire-reports");
-        cleanSurefireReports(reportsDir, mavenDir);
+        try {
+            cleanSurefireReports(reportsDir, mavenDir);
+        } catch (IOException e) {
+            log.error("清理 Surefire 报告失败，停止执行以避免旧报告污染: {}", reportsDir, e);
+            return new TestExecutionResult(
+                    projectId, false, "MAVEN_ERROR", -1, 0, 0, 0, 0, 0, "",
+                    "清理 Surefire 报告失败，无法确保报告准确性，已停止执行: " + e.getMessage());
+        }
 
         // 2. 执行固定的 Maven test 命令，不接受用户参数
         ProcessResult processResult = mavenProcessRunner.run(
@@ -117,7 +124,7 @@ public class TestExecutionServiceImpl implements TestExecutionService {
             // 退出码为 0
             if (!summary.isReportFound()) {
                 status = "NO_REPORTS";
-                success = true; // 构建成功但无测试报告（可能没有测试类）
+                success = false; // 构建成功但无测试报告，不能视为测试通过
                 errorMessage = "Maven 构建成功，但未找到 Surefire 报告，可能没有可执行的测试";
             } else if (summary.getFailedTests() > 0) {
                 // 理论上退出码 0 时失败数应为 0，防御性处理
@@ -159,8 +166,11 @@ public class TestExecutionServiceImpl implements TestExecutionService {
      * <p>
      * 安全约束：只删除 reportsDir 下的内容，且所有路径必须在 mavenDir 内。
      * 不跟随符号链接（不删除符号链接指向的外部文件）。
+     * 若清理过程中任一文件删除失败，抛出 IOException 由调用方决定是否继续。
+     *
+     * @throws IOException 遍历目录或删除文件失败时抛出
      */
-    private void cleanSurefireReports(Path reportsDir, Path mavenDir) {
+    private void cleanSurefireReports(Path reportsDir, Path mavenDir) throws IOException {
         if (!Files.isDirectory(reportsDir)) {
             return;
         }
@@ -172,7 +182,7 @@ public class TestExecutionServiceImpl implements TestExecutionService {
                     .sorted(Comparator.reverseOrder())
                     .toList();
             for (Path p : paths) {
-                // 不删除符号链接指向的目标，只删除链接本身
+                // 不删除符号链接指向的目标，只删除链接本身；跳过 reportsDir 自身
                 if (Files.isSymbolicLink(p) || p.equals(reportsDir)) {
                     continue;
                 }
@@ -180,10 +190,9 @@ public class TestExecutionServiceImpl implements TestExecutionService {
                     Files.deleteIfExists(p);
                 } catch (IOException e) {
                     log.warn("清理 Surefire 报告文件失败: {}", p, e);
+                    throw e;
                 }
             }
-        } catch (IOException e) {
-            log.warn("遍历 Surefire 报告目录失败: {}", reportsDir, e);
         }
     }
 }

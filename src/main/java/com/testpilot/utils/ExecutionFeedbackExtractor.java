@@ -39,9 +39,13 @@ public final class ExecutionFeedbackExtractor {
             "(Could not resolve dependencies|Non-resolvable|Failed to collect dependencies|"
                     + "Could not find artifact|Could not transfer artifact)", Pattern.CASE_INSENSITIVE);
 
-    // 插件错误（非 compiler 插件）
-    private static final Pattern PLUGIN_ERROR_PATTERN = Pattern.compile(
-            "Failed to execute goal .*?:(?!maven-compiler-plugin).*?:.*?\\(.*?\\) on project");
+    // 匹配 "Failed to execute goal <groupId>:<artifactId>:<version>:<goal> [(<executionId>)] on project"
+    // 捕获插件 artifactId（第 1 组），用于区分 maven-compiler-plugin 和其他插件
+    private static final Pattern PLUGIN_GOAL_PATTERN = Pattern.compile(
+            "Failed to execute goal\\s+[^:\\s]+:([^:\\s]+):[^:\\s]+:[^\\s(]+(?:\\s+\\([^)]*\\))?\\s+on\\s+project");
+
+    // maven-compiler-plugin 的 artifactId，其错误属于编译错误，应按源码路径分类而非 PLUGIN
+    private static final String COMPILER_PLUGIN_ARTIFACT_ID = "maven-compiler-plugin";
 
     // 最多保留的编译错误行数
     private static final int MAX_COMPILE_ERRORS = 20;
@@ -95,8 +99,24 @@ public final class ExecutionFeedbackExtractor {
                     List.of(summary), List.of(), summary);
         }
 
-        // 2. 判断是否为插件错误（非 compiler 插件）
-        boolean pluginError = PLUGIN_ERROR_PATTERN.matcher(output).find();
+        // 2. 检测 "Failed to execute goal" 行，提取所有插件 artifactId
+        //    - 只有非 maven-compiler-plugin 的插件错误才标记为 PLUGIN
+        //    - maven-compiler-plugin 的错误属于编译错误，继续按源码路径分类
+        boolean hasNonCompilerPluginError = false;
+        Matcher pluginMatcher = PLUGIN_GOAL_PATTERN.matcher(output);
+        while (pluginMatcher.find()) {
+            String artifactId = pluginMatcher.group(1);
+            if (!COMPILER_PLUGIN_ARTIFACT_ID.equals(artifactId)) {
+                hasNonCompilerPluginError = true;
+                break;
+            }
+        }
+
+        if (hasNonCompilerPluginError) {
+            String summary = "Maven 插件执行失败（非 compiler 插件），不允许自动修复";
+            return new FailureFeedback(FailureType.COMPILE, CompileErrorSource.PLUGIN,
+                    List.of(summary), List.of(), summary);
+        }
 
         // 3. 提取编译错误行并分类
         List<String> errors = new ArrayList<>();
@@ -167,9 +187,7 @@ public final class ExecutionFeedbackExtractor {
 
         // 4. 确定错误来源
         CompileErrorSource source;
-        if (pluginError) {
-            source = CompileErrorSource.PLUGIN;
-        } else if (hasMainSourceError) {
+        if (hasMainSourceError) {
             // 业务源码错误优先：不允许 LLM 修复
             source = CompileErrorSource.MAIN_SOURCE;
         } else if (hasTestSourceError && !hasOtherSourceError) {
@@ -212,8 +230,11 @@ public final class ExecutionFeedbackExtractor {
             return CompileErrorSource.UNKNOWN;
         }
         // 路径信息不足时，若文件名与 TestPilot 生成的测试文件名一致，判定为测试源码
-        if (testFileName != null && normalized.endsWith("/" + testFileName)) {
-            return CompileErrorSource.TEST_SOURCE;
+        if (testFileName != null) {
+            String fileName = extractFileName(normalized);
+            if (testFileName.equals(fileName)) {
+                return CompileErrorSource.TEST_SOURCE;
+            }
         }
         return CompileErrorSource.UNKNOWN;
     }

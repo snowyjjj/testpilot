@@ -13,6 +13,7 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -57,7 +58,7 @@ public final class SurefireReportParser {
 
         try (Stream<Path> files = Files.list(reportsDir)) {
             List<Path> txtFiles = files
-                    .filter(Files::isRegularFile)
+                    .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
                     .filter(p -> p.getFileName().toString().endsWith(".txt"))
                     .sorted()
                     .toList();
@@ -99,7 +100,7 @@ public final class SurefireReportParser {
 
         try (Stream<Path> files = Files.list(reportsDir)) {
             List<Path> xmlFiles = files
-                    .filter(Files::isRegularFile)
+                    .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
                     .filter(p -> p.getFileName().toString().startsWith("TEST-")
                             && p.getFileName().toString().endsWith(".xml"))
                     .sorted()

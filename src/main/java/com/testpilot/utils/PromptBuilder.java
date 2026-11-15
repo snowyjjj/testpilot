@@ -1,5 +1,9 @@
 package com.testpilot.utils;
 
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.testpilot.dto.FailureFeedback;
 import com.testpilot.dto.FailureFeedback.FailedCaseInfo;
 import com.testpilot.dto.JUnitVersion;
@@ -7,6 +11,7 @@ import com.testpilot.dto.MethodContext;
 import com.testpilot.dto.MethodParameter;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -190,9 +195,10 @@ public final class PromptBuilder {
      * 增强修复代码校验：
      * 1. 测试类名必须为 {expectedClassName}Test。
      * 2. 修复后 @Test 方法数量不得少于修复前（防止删除测试场景）。
-     * 3. 不允许使用 @Disabled / @Ignore 等跳过注解。
-     * 4. 必须包含断言方法（assert*）。
-     * 5. 基础校验（package/class/@Test/import）仍需通过。
+     * 3. 修复后断言数量不得少于修复前（防止弱化断言）。
+     * 4. 不允许使用 @Disabled / @Ignore 等跳过注解。
+     * 5. 必须包含断言方法（assert*）。
+     * 6. 基础校验（package/class/@Test/import）仍需通过。
      *
      * @return null 表示校验通过，否则返回错误描述
      */
@@ -214,7 +220,7 @@ public final class PromptBuilder {
             return "修复后的测试类名必须为 " + expectedTestClass;
         }
 
-        // 2. @Test 方法数量对比
+        // 2. @Test 方法数量对比（使用 JavaParser 精确统计）
         int originalTestCount = countTestMethods(originalCode);
         int repairedTestCount = countTestMethods(repairedCode);
         if (repairedTestCount < originalTestCount) {
@@ -224,32 +230,82 @@ public final class PromptBuilder {
             return "修复后的代码没有任何 @Test 方法";
         }
 
-        // 3. 跳过注解校验
-        if (containsSkipAnnotation(repairedCode)) {
-            return "修复后的代码包含 @Disabled / @Ignore 等跳过注解，不允许跳过失败测试";
+        // 3. 断言数量对比（防止通过删除断言弱化测试）
+        int originalAssertCount = countAssertions(originalCode);
+        int repairedAssertCount = countAssertions(repairedCode);
+        if (repairedAssertCount < originalAssertCount) {
+            return "修复后断言数量(" + repairedAssertCount + ")少于修复前(" + originalAssertCount + ")，不允许弱化断言";
+        }
+        if (repairedAssertCount == 0) {
+            return "修复后的代码未包含任何断言方法（assert*），测试无效";
         }
 
-        // 4. 断言校验
-        if (!containsAssertion(repairedCode)) {
-            return "修复后的代码未包含任何断言方法（assert*），测试无效";
+        // 4. 跳过注解校验
+        if (containsSkipAnnotation(repairedCode)) {
+            return "修复后的代码包含 @Disabled / @Ignore 等跳过注解，不允许跳过失败测试";
         }
 
         return null;
     }
 
     /**
-     * 统计代码中 @Test 注解的数量（粗略统计，不做完整语法解析）。
+     * 统计代码中 @Test 注解的方法数量。
+     * 优先使用 JavaParser 精确统计；解析失败时回退到正则粗略统计。
      */
     public static int countTestMethods(String code) {
         if (code == null || code.isBlank()) {
             return 0;
         }
-        int count = 0;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("@Test\\b").matcher(code);
-        while (m.find()) {
-            count++;
+        try {
+            CompilationUnit cu = StaticJavaParser.parse(code);
+            List<MethodDeclaration> methods = cu.findAll(MethodDeclaration.class);
+            int count = 0;
+            for (MethodDeclaration m : methods) {
+                if (m.getAnnotationByName("Test").isPresent()) {
+                    count++;
+                }
+            }
+            return count;
+        } catch (Exception e) {
+            // JavaParser 解析失败，回退到正则
+            int count = 0;
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("@Test\\b").matcher(code);
+            while (m.find()) {
+                count++;
+            }
+            return count;
         }
-        return count;
+    }
+
+    /**
+     * 统计代码中断言方法调用的数量（assert* 方法调用）。
+     * 优先使用 JavaParser 精确统计；解析失败时回退到正则粗略统计。
+     */
+    public static int countAssertions(String code) {
+        if (code == null || code.isBlank()) {
+            return 0;
+        }
+        try {
+            CompilationUnit cu = StaticJavaParser.parse(code);
+            List<MethodCallExpr> calls = cu.findAll(MethodCallExpr.class);
+            int count = 0;
+            for (MethodCallExpr call : calls) {
+                String name = call.getNameAsString();
+                if (name.startsWith("assert")) {
+                    count++;
+                }
+            }
+            return count;
+        } catch (Exception e) {
+            // JavaParser 解析失败，回退到正则
+            java.util.regex.Pattern p = java.util.regex.Pattern.compile("\\bAssert(ions)?\\.assert\\w+|\\bassert\\w+\\s*\\(");
+            java.util.regex.Matcher m = p.matcher(code);
+            int count = 0;
+            while (m.find()) {
+                count++;
+            }
+            return count;
+        }
     }
 
     /**

@@ -486,4 +486,93 @@ class TestOptimizationServiceImplTest {
         assertNotNull(error);
         assertTrue(error.contains("Disabled") || error.contains("跳过") || error.contains("Ignore"));
     }
+
+    // 21. 修复后编译错误来自业务源码（非 TEST_SOURCE）：恢复测试代码并停止
+    @Test
+    void optimize_repairedThenMainSourceCompileError_restoresAndStops() throws IOException {
+        setupCommonMocks();
+        Path testFile = writeExistingTest(validJUnit4Test());
+        String original = validJUnit4Test();
+
+        // 初次 FAILED -> 修复 -> 再次执行 COMPILE_ERROR（错误来自 src/main/java）
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(result("FAILED", false, 1, 1, ""))
+                .thenReturn(result("COMPILE_ERROR", false, 1, 0,
+                        "[ERROR] /x/src/main/java/com/example/Calculator.java:[5,8] ';' expected"));
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        assertFalse(r.isOptimizationSuccess());
+        assertEquals(1, r.getRetryCount());
+        // 只调用一次 LLM（修复后不再继续）
+        verify(llmService, times(1)).chat(anyString());
+        // 测试代码应被恢复为原始版本
+        assertEquals(original, Files.readString(testFile, StandardCharsets.UTF_8));
+        // 修复记录中应标记为已恢复（repaired=true 表示代码已恢复）
+        RepairRecord rec = r.getRepairRecords().get(0);
+        assertTrue(rec.isRepaired(), "应记录测试代码已恢复");
+        assertTrue(rec.getFeedbackSummary().contains("恢复"));
+    }
+
+    // 22. validateRepairedCode：删除断言应被拒绝
+    @Test
+    void validateRepairedCode_removesAssertions_rejected() {
+        String original = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Calculator c = new Calculator();\n"
+                + "    Assert.assertEquals(3, c.add(1, 2));\n"
+                + "    Assert.assertTrue(c.add(1, 2) > 0);\n"
+                + "  }\n"
+                + "}\n";
+        // 修复后删除了一个断言（只剩一个 assertEquals）
+        String repaired = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Calculator c = new Calculator();\n"
+                + "    Assert.assertEquals(3, c.add(1, 2));\n"
+                + "  }\n"
+                + "}\n";
+
+        String error = PromptBuilder.validateRepairedCode(
+                original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
+
+        assertNotNull(error);
+        assertTrue(error.contains("断言"), "错误信息应提到断言数量: " + error);
+    }
+
+    // 23. validateRepairedCode：相同数量断言和测试方法应通过
+    @Test
+    void validateRepairedCode_sameCount_passes() {
+        String original = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "  }\n"
+                + "}\n";
+        String repaired = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "  }\n"
+                + "}\n";
+
+        String error = PromptBuilder.validateRepairedCode(
+                original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
+
+        assertNull(error, "相同数量的测试方法和断言应通过校验");
+    }
 }
