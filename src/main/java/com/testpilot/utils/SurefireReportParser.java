@@ -45,8 +45,9 @@ public final class SurefireReportParser {
      * @return 汇总结果；若目录不存在或无报告文件，reportFound 为 false
      */
     public static SurefireSummary parse(Path reportsDir) {
-        if (reportsDir == null || !Files.isDirectory(reportsDir)) {
-            log.debug("Surefire 报告目录不存在: {}", reportsDir);
+        // 使用 NOFOLLOW_LINKS：若 reportsDir 本身是符号链接，拒绝读取其目标
+        if (reportsDir == null || !Files.isDirectory(reportsDir, LinkOption.NOFOLLOW_LINKS)) {
+            log.debug("Surefire 报告目录不存在或为符号链接: {}", reportsDir);
             return new SurefireSummary(false, 0, 0, 0, 0);
         }
 
@@ -94,7 +95,8 @@ public final class SurefireReportParser {
      */
     public static List<FailedCase> parseXmlFailures(Path reportsDir, int maxStackLength) {
         List<FailedCase> result = new ArrayList<>();
-        if (reportsDir == null || !Files.isDirectory(reportsDir)) {
+        // 使用 NOFOLLOW_LINKS：若 reportsDir 本身是符号链接，拒绝读取其目标
+        if (reportsDir == null || !Files.isDirectory(reportsDir, LinkOption.NOFOLLOW_LINKS)) {
             return result;
         }
 

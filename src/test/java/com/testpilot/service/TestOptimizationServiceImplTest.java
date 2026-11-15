@@ -139,7 +139,7 @@ class TestOptimizationServiceImplTest {
         setupCommonMocks();
         writeExistingTest(validJUnit4Test());
         TestExecutionResult compileError = result("COMPILE_ERROR", false, 1, 0,
-                "[ERROR] /x/CalculatorTest.java:[10,13] cannot find symbol\n[ERROR] symbol: class Foo");
+                "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol\n[ERROR] symbol: class Foo");
         TestExecutionResult passed = result("PASSED", true, 0, 0, "");
         when(testExecutionService.executeTests(anyString()))
                 .thenReturn(compileError)
@@ -240,7 +240,7 @@ class TestOptimizationServiceImplTest {
         Path testFile = writeExistingTest(validJUnit4Test());
         when(testExecutionService.executeTests(anyString()))
                 .thenReturn(result("COMPILE_ERROR", false, 1, 0,
-                        "[ERROR] /x/CalculatorTest.java:[10,13] cannot find symbol"));
+                        "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol"));
         // LLM 返回无效内容（没有 @Test）
         when(llmService.chat(anyString())).thenReturn("```java\npackage com.example;\nclass NotATest {}\n```");
 
@@ -261,7 +261,7 @@ class TestOptimizationServiceImplTest {
         Path testFile = writeExistingTest(validJUnit4Test());
         when(testExecutionService.executeTests(anyString()))
                 .thenReturn(result("COMPILE_ERROR", false, 1, 0,
-                        "[ERROR] /x/CalculatorTest.java:[10,13] cannot find symbol"))
+                        "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol"))
                 .thenReturn(result("PASSED", true, 0, 0, ""));
         String repaired = "package com.example;\n"
                 + "import org.junit.Test;\n"
@@ -291,7 +291,7 @@ class TestOptimizationServiceImplTest {
 
         when(testExecutionService.executeTests(anyString()))
                 .thenReturn(result("COMPILE_ERROR", false, 1, 0,
-                        "[ERROR] /x/CalculatorTest.java:[10,13] cannot find symbol"))
+                        "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol"))
                 .thenThrow(new RuntimeException("Maven exploded"));
         when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
 
@@ -450,8 +450,19 @@ class TestOptimizationServiceImplTest {
     // 18. validateRepairedCode：修复后删除测试方法应被拒绝
     @Test
     void validateRepairedCode_removesTestMethod_rejected() {
-        String original = validJUnit4Test()
-                + "  @Test\n  public void testSub() { Assert.assertEquals(1, c.sub(3, 2)); }\n";
+        String original = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "  }\n"
+                + "  @Test\n"
+                + "  public void testSub() {\n"
+                + "    Assert.assertEquals(1, new Calculator().sub(3, 2));\n"
+                + "  }\n"
+                + "}\n";
         String repaired = validJUnit4Test(); // 少了一个 @Test 方法
 
         String error = PromptBuilder.validateRepairedCode(
@@ -574,5 +585,116 @@ class TestOptimizationServiceImplTest {
                 original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
 
         assertNull(error, "相同数量的测试方法和断言应通过校验");
+    }
+
+    // 24. containsSkipAnnotation：注释中的 @Disabled 不应被误判
+    @Test
+    void containsSkipAnnotation_disabledInComment_notDetected() {
+        String code = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "// 注意：这里提到了 @Disabled 但它只是注释\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "  }\n"
+                + "}\n";
+
+        assertFalse(PromptBuilder.containsSkipAnnotation(code),
+                "注释中的 @Disabled 不应被判定为跳过注解");
+    }
+
+    // 25. containsSkipAnnotation：字符串中的 @Ignore 不应被误判
+    @Test
+    void containsSkipAnnotation_ignoreInString_notDetected() {
+        String code = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    String note = \"此测试不能被 @Ignore\";\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "  }\n"
+                + "}\n";
+
+        assertFalse(PromptBuilder.containsSkipAnnotation(code),
+                "字符串字面量中的 @Ignore 不应被判定为跳过注解");
+    }
+
+    // 26. countAssertions：自定义 assertSomething() 不应被当成 JUnit 断言
+    @Test
+    void countAssertions_customAssertMethod_notCounted() {
+        String code = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "public class CalculatorTest {\n"
+                + "  private void assertSomething(Object o) {}\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    assertSomething(new Object());\n"
+                + "    assertSomething(null);\n"
+                + "  }\n"
+                + "}\n";
+
+        assertEquals(0, PromptBuilder.countAssertions(code),
+                "自定义的 assertSomething() 不应被统计为 JUnit 断言");
+    }
+
+    // 27. countAssertions：真实 JUnit 断言应被正确统计
+    @Test
+    void countAssertions_realJUnitAssertions_counted() {
+        String code = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import org.junit.Assert;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "    Assert.assertTrue(new Calculator().add(1, 2) > 0);\n"
+                + "  }\n"
+                + "}\n";
+
+        assertEquals(2, PromptBuilder.countAssertions(code),
+                "真实的 Assert.assertXxx 应被统计为 JUnit 断言");
+    }
+
+    // 28. validateRepairedCode：JavaParser 解析失败时应拒绝修复代码
+    @Test
+    void validateRepairedCode_unparseableCode_rejected() {
+        String original = validJUnit4Test();
+        // 修复后的代码是不合法的 Java 语法（缺少 class 声明闭合）
+        String repaired = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    Assert.assertEquals(3, new Calculator().add(1, 2));\n"
+                + "  }\n";
+        // 缺少闭合 }，JavaParser 解析失败
+
+        String error = PromptBuilder.validateRepairedCode(
+                original, repaired, "Calculator", "com.example", JUnitVersion.JUNIT4);
+
+        assertNotNull(error, "JavaParser 解析失败的修复代码应被拒绝");
+    }
+
+    // 29. countAssertions：静态导入的 JUnit 断言应被正确统计
+    @Test
+    void countAssertions_staticallyImportedAssertions_counted() {
+        String code = "package com.example;\n"
+                + "import org.junit.Test;\n"
+                + "import static org.junit.Assert.assertEquals;\n"
+                + "import static org.junit.Assert.assertTrue;\n"
+                + "public class CalculatorTest {\n"
+                + "  @Test\n"
+                + "  public void testAdd() {\n"
+                + "    assertEquals(3, new Calculator().add(1, 2));\n"
+                + "    assertTrue(new Calculator().add(1, 2) > 0);\n"
+                + "  }\n"
+                + "}\n";
+
+        assertEquals(2, PromptBuilder.countAssertions(code),
+                "静态导入的 Assert.assertXxx 应被统计为 JUnit 断言");
     }
 }

@@ -2,7 +2,10 @@ package com.testpilot.utils;
 
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.testpilot.dto.FailureFeedback;
 import com.testpilot.dto.FailureFeedback.FailedCaseInfo;
@@ -11,7 +14,10 @@ import com.testpilot.dto.MethodContext;
 import com.testpilot.dto.MethodParameter;
 
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -249,8 +255,8 @@ public final class PromptBuilder {
     }
 
     /**
-     * 统计代码中 @Test 注解的方法数量。
-     * 优先使用 JavaParser 精确统计；解析失败时回退到正则粗略统计。
+     * 统计代码中带有 @Test 注解的方法数量。
+     * 使用 JavaParser 精确统计；解析失败时返回 0（不回退正则，由调用方拒绝）。
      */
     public static int countTestMethods(String code) {
         if (code == null || code.isBlank()) {
@@ -267,19 +273,19 @@ public final class PromptBuilder {
             }
             return count;
         } catch (Exception e) {
-            // JavaParser 解析失败，回退到正则
-            int count = 0;
-            java.util.regex.Matcher m = java.util.regex.Pattern.compile("@Test\\b").matcher(code);
-            while (m.find()) {
-                count++;
-            }
-            return count;
+            // JavaParser 解析失败，返回 0，不回退到正则统计
+            return 0;
         }
     }
 
     /**
-     * 统计代码中断言方法调用的数量（assert* 方法调用）。
-     * 优先使用 JavaParser 精确统计；解析失败时回退到正则粗略统计。
+     * 统计代码中真实 JUnit 断言方法调用的数量。
+     * <p>
+     * 仅识别 JUnit 断言（JUnit 4: org.junit.Assert.* / Assert.*；
+     * JUnit 5: org.junit.jupiter.api.Assertions.* / Assertions.*），
+     * 不统计自定义的 assertSomething() 方法。
+     * <p>
+     * 使用 JavaParser AST 精确统计；解析失败时返回 0（不回退正则，由调用方拒绝）。
      */
     public static int countAssertions(String code) {
         if (code == null || code.isBlank()) {
@@ -287,35 +293,86 @@ public final class PromptBuilder {
         }
         try {
             CompilationUnit cu = StaticJavaParser.parse(code);
-            List<MethodCallExpr> calls = cu.findAll(MethodCallExpr.class);
+
+            // 收集静态导入的 JUnit 断言方法
+            Set<String> staticAssertImports = new HashSet<>();
+            boolean junit4AssertStar = false;
+            boolean junit5AssertionsStar = false;
+            for (ImportDeclaration imp : cu.findAll(ImportDeclaration.class)) {
+                if (!imp.isStatic()) {
+                    continue;
+                }
+                String name = imp.getNameAsString();
+                if (name.equals("org.junit.Assert") || name.startsWith("org.junit.Assert.")) {
+                    if (imp.isAsterisk()) {
+                        junit4AssertStar = true;
+                    } else {
+                        staticAssertImports.add(imp.getName().getIdentifier());
+                    }
+                } else if (name.equals("org.junit.jupiter.api.Assertions")
+                        || name.startsWith("org.junit.jupiter.api.Assertions.")) {
+                    if (imp.isAsterisk()) {
+                        junit5AssertionsStar = true;
+                    } else {
+                        staticAssertImports.add(imp.getName().getIdentifier());
+                    }
+                }
+            }
+
             int count = 0;
-            for (MethodCallExpr call : calls) {
+            for (MethodCallExpr call : cu.findAll(MethodCallExpr.class)) {
                 String name = call.getNameAsString();
-                if (name.startsWith("assert")) {
-                    count++;
+                if (!name.startsWith("assert")) {
+                    continue;
+                }
+                Optional<Expression> scope = call.getScope();
+                if (scope.isPresent()) {
+                    // 有作用域：Assert.assert* / Assertions.assert* / 全限定名
+                    String scopeStr = scope.get().toString();
+                    if ("Assert".equals(scopeStr) || "org.junit.Assert".equals(scopeStr)
+                            || "Assertions".equals(scopeStr)
+                            || "org.junit.jupiter.api.Assertions".equals(scopeStr)) {
+                        count++;
+                    }
+                } else {
+                    // 无作用域：必须是通过 static import 导入的 JUnit 断言
+                    if (junit4AssertStar || junit5AssertionsStar
+                            || staticAssertImports.contains(name)) {
+                        count++;
+                    }
                 }
             }
             return count;
         } catch (Exception e) {
-            // JavaParser 解析失败，回退到正则
-            java.util.regex.Pattern p = java.util.regex.Pattern.compile("\\bAssert(ions)?\\.assert\\w+|\\bassert\\w+\\s*\\(");
-            java.util.regex.Matcher m = p.matcher(code);
-            int count = 0;
-            while (m.find()) {
-                count++;
-            }
-            return count;
+            // JavaParser 解析失败，返回 0，不回退到正则统计
+            return 0;
         }
     }
 
     /**
-     * 检测代码中是否包含跳过测试的注解（@Disabled、@Ignore）。
+     * 使用 JavaParser AST 检测代码中是否包含跳过测试的注解（@Disabled、@Ignore）。
+     * 仅检测真实的注解声明，不会误判注释或字符串中的 @Disabled / @Ignore。
      */
     public static boolean containsSkipAnnotation(String code) {
         if (code == null || code.isBlank()) {
             return false;
         }
-        return code.contains("@Disabled") || code.contains("@Ignore");
+        try {
+            CompilationUnit cu = StaticJavaParser.parse(code);
+            for (AnnotationExpr ann : cu.findAll(AnnotationExpr.class)) {
+                String name = ann.getNameAsString();
+                if ("Disabled".equals(name) || "Ignore".equals(name)
+                        || "org.junit.jupiter.api.Disabled".equals(name)
+                        || "org.junit.Ignore".equals(name)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            // 解析失败时保守返回 false（不认为有跳过注解），
+            // 实际会因 countTestMethods/countAssertions 返回 0 而被拒绝
+            return false;
+        }
     }
 
     /**

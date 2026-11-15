@@ -213,6 +213,9 @@ public final class ExecutionFeedbackExtractor {
 
     /**
      * 根据错误文件路径判断编译错误来源。
+     * <p>
+     * 仅当路径明确属于 TestPilot 生成的测试文件（/src/test/java/ 且文件名匹配）时，
+     * 才判定为 TEST_SOURCE。路径信息不足时一律判为 UNKNOWN，不允许仅凭文件名猜测。
      */
     private static CompileErrorSource classifySource(String filePath, String testFileName) {
         String normalized = filePath.replace('\\', '/');
@@ -229,13 +232,7 @@ public final class ExecutionFeedbackExtractor {
         if (normalized.contains("/target/generated-sources/")) {
             return CompileErrorSource.UNKNOWN;
         }
-        // 路径信息不足时，若文件名与 TestPilot 生成的测试文件名一致，判定为测试源码
-        if (testFileName != null) {
-            String fileName = extractFileName(normalized);
-            if (testFileName.equals(fileName)) {
-                return CompileErrorSource.TEST_SOURCE;
-            }
-        }
+        // 路径信息不足，无法确认是否为 TestPilot 生成的目标测试文件，保守处理为 UNKNOWN
         return CompileErrorSource.UNKNOWN;
     }
 

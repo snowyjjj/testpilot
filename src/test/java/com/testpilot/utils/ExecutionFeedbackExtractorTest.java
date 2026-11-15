@@ -217,4 +217,26 @@ class ExecutionFeedbackExtractorTest {
         assertNotNull(fb);
         assertEquals(CompileErrorSource.TEST_SOURCE, fb.getCompileErrorSource());
     }
+
+    /**
+     * 同名但路径不属于 TestPilot 生成的目标测试文件（不在 /src/test/java/ 下）。
+     * 即使文件名与目标测试文件相同，也应判为 UNKNOWN，不允许 LLM 修复。
+     */
+    @Test
+    void extract_sameFileNameButNotTargetPath_classifiedAsUnknown() {
+        String output = """
+                [INFO] --- maven-compiler-plugin:3.11.0:compile (default-compile) @ demo ---
+                [INFO] Compiling 2 source files
+                [ERROR] /home/user/project/CalculatorTest.java:[10,13] cannot find symbol
+                [ERROR]   symbol:   class Foo
+                [ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.11.0:compile (default-compile) on project demo: Compilation failure
+                """;
+
+        FailureFeedback fb = ExecutionFeedbackExtractor.extract(
+                compileResult(output), Path.of("target/surefire-reports"), TEST_FILE_NAME);
+
+        assertNotNull(fb);
+        assertEquals(CompileErrorSource.UNKNOWN, fb.getCompileErrorSource(),
+                "路径不在 /src/test/java/ 下的同名文件不应被判为 TEST_SOURCE");
+    }
 }

@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Comparator;
@@ -171,7 +172,8 @@ public class TestExecutionServiceImpl implements TestExecutionService {
      * @throws IOException 遍历目录或删除文件失败时抛出
      */
     private void cleanSurefireReports(Path reportsDir, Path mavenDir) throws IOException {
-        if (!Files.isDirectory(reportsDir)) {
+        // 使用 NOFOLLOW_LINKS：若 reportsDir 本身是符号链接，拒绝清理其目标
+        if (!Files.isDirectory(reportsDir, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
         Path normalizedMaven = mavenDir.normalize();

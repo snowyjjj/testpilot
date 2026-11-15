@@ -1,11 +1,13 @@
 package com.testpilot.utils;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -174,5 +176,63 @@ class SurefireReportParserTest {
     @Test
     void parseXmlFailures_noXmlFiles_returnsEmpty() {
         assertTrue(SurefireReportParser.parseXmlFailures(tempDir, 500).isEmpty());
+    }
+
+    // ============ 报告目录符号链接保护测试 ============
+
+    @Test
+    void parse_reportsDirIsSymlink_rejected() throws IOException {
+        // 创建一个真实目录并写入报告
+        Path realDir = Files.createTempDirectory("real-reports");
+        Files.writeString(realDir.resolve("TEST-com.example.CalculatorTest.txt"),
+                "Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n",
+                StandardCharsets.UTF_8);
+
+        Path symlink = tempDir.resolve("reports-symlink");
+        try {
+            Files.createSymbolicLink(symlink, realDir);
+        } catch (IOException e) {
+            // 当前系统不支持符号链接，跳过测试
+            Assumptions.assumeTrue(false, "当前系统不支持符号链接，跳过测试");
+            return;
+        }
+
+        // 即使符号链接指向有效报告目录，也应拒绝读取
+        boolean symlinkDetected = !Files.isDirectory(symlink, LinkOption.NOFOLLOW_LINKS);
+        Assumptions.assumeTrue(symlinkDetected,
+                "当前 JVM 无法通过 NOFOLLOW_LINKS 识别符号链接，跳过测试");
+
+        SurefireReportParser.SurefireSummary summary = SurefireReportParser.parse(symlink);
+        assertFalse(summary.isReportFound(), "符号链接目录不应被读取");
+        assertEquals(0, summary.getTotalTests());
+    }
+
+    @Test
+    void parseXmlFailures_reportsDirIsSymlink_rejected() throws IOException {
+        Path realDir = Files.createTempDirectory("real-reports");
+        Files.writeString(realDir.resolve("TEST-com.example.CalculatorTest.xml"),
+                """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <testsuite tests="1" failures="1" errors="0">
+                  <testcase classname="C" name="m">
+                    <failure type="java.lang.AssertionError">fail</failure>
+                  </testcase>
+                </testsuite>
+                """, StandardCharsets.UTF_8);
+
+        Path symlink = tempDir.resolve("reports-symlink-xml");
+        try {
+            Files.createSymbolicLink(symlink, realDir);
+        } catch (IOException e) {
+            Assumptions.assumeTrue(false, "当前系统不支持符号链接，跳过测试");
+            return;
+        }
+
+        boolean symlinkDetected = !Files.isDirectory(symlink, LinkOption.NOFOLLOW_LINKS);
+        Assumptions.assumeTrue(symlinkDetected,
+                "当前 JVM 无法通过 NOFOLLOW_LINKS 识别符号链接，跳过测试");
+
+        var failures = SurefireReportParser.parseXmlFailures(symlink, 500);
+        assertTrue(failures.isEmpty(), "符号链接目录中的失败用例不应被解析");
     }
 }
