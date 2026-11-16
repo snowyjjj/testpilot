@@ -165,14 +165,24 @@ public class TestExecutionServiceImpl implements TestExecutionService {
     /**
      * 清理 Surefire 报告目录，避免旧报告污染本次执行结果。
      * <p>
-     * 安全约束：只删除 reportsDir 下的内容，且所有路径必须在 mavenDir 内。
-     * 不跟随符号链接（不删除符号链接指向的外部文件）。
-     * 若清理过程中任一文件删除失败，抛出 IOException 由调用方决定是否继续。
+     * 安全约束：
+     * <ul>
+     *   <li>reportsDir 本身是符号链接时，拒绝处理并抛出 IOException（不跟随到外部目标）。</li>
+     *   <li>reportsDir 不存在时正常返回。</li>
+     *   <li>只删除 reportsDir 下的内容，且所有路径必须在 mavenDir 内。</li>
+     *   <li>对内部符号链接，只删除链接本身，不跟随链接删除外部目标。</li>
+     *   <li>reportsDir 自身不在清理范围内。</li>
+     *   <li>任一删除失败抛出 IOException，由调用方中止 Maven 执行。</li>
+     * </ul>
      *
-     * @throws IOException 遍历目录或删除文件失败时抛出
+     * @throws IOException reportsDir 为符号链接、遍历目录或删除文件失败时抛出
      */
     private void cleanSurefireReports(Path reportsDir, Path mavenDir) throws IOException {
-        // 使用 NOFOLLOW_LINKS：若 reportsDir 本身是符号链接，拒绝清理其目标
+        // reportsDir 本身是符号链接时，拒绝处理（不读取链接目标）
+        if (Files.isSymbolicLink(reportsDir)) {
+            throw new IOException("Surefire 报告目录是符号链接，存在安全风险: " + reportsDir);
+        }
+        // 目录不存在时正常返回
         if (!Files.isDirectory(reportsDir, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
@@ -184,10 +194,11 @@ public class TestExecutionServiceImpl implements TestExecutionService {
                     .sorted(Comparator.reverseOrder())
                     .toList();
             for (Path p : paths) {
-                // 不删除符号链接指向的目标，只删除链接本身；跳过 reportsDir 自身
-                if (Files.isSymbolicLink(p) || p.equals(reportsDir)) {
+                // reportsDir 自身不在清理范围内
+                if (p.equals(reportsDir)) {
                     continue;
                 }
+                // 符号链接：Files.deleteIfExists 只删除链接本身，不跟随到外部目标
                 try {
                     Files.deleteIfExists(p);
                 } catch (IOException e) {

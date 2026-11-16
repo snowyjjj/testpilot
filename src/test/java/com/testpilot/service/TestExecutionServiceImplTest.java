@@ -7,6 +7,7 @@ import com.testpilot.utils.MavenProcessRunner;
 import com.testpilot.utils.ProcessResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
@@ -281,5 +282,122 @@ class TestExecutionServiceImplTest {
             assertEquals("MAVEN_ERROR", result.getStatus());
             verify(processRunner, never()).run(any(), any(), any(), anyInt());
         }
+    }
+
+    // ============ 符号链接安全测试 ============
+
+    /**
+     * 检测当前环境是否支持通过 Files.isSymbolicLink 识别符号链接。
+     * 在某些 Windows 环境下，createSymbolicLink 成功但 isSymbolicLink 返回 false，
+     * 此时依赖 isSymbolicLink 的测试应跳过。
+     */
+    private boolean isSymbolicLinkDetectable(Path base) {
+        Path target = base.resolve("symlink-target");
+        Path link = base.resolve("symlink-link");
+        try {
+            Files.createDirectories(target);
+            Files.createSymbolicLink(link, target);
+            return Files.isSymbolicLink(link);
+        } catch (IOException e) {
+            return false;
+        } finally {
+            try {
+                Files.deleteIfExists(link);
+                Files.deleteIfExists(target);
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    /**
+     * reportsDir 本身是符号链接时，cleanSurefireReports 应抛出 IOException，
+     * doExecute 不应调用 MavenProcessRunner。
+     */
+    @Test
+    void executeTests_reportsDirIsSymlink_stopsExecution() throws IOException {
+        Assumptions.assumeTrue(isSymbolicLinkDetectable(tempDir),
+                "当前环境无法通过 Files.isSymbolicLink 识别符号链接，跳过测试");
+
+        Path realReportsDir = tempDir.resolve("target").resolve("surefire-reports-real");
+        Files.createDirectories(realReportsDir);
+        Files.writeString(realReportsDir.resolve("stale.txt"), "Tests run: 99, Failures: 99");
+
+        Path reportsDir = tempDir.resolve("target").resolve("surefire-reports");
+        Files.createSymbolicLink(reportsDir, realReportsDir);
+
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        assertEquals("MAVEN_ERROR", result.getStatus(),
+                "reportsDir 为符号链接时应返回 MAVEN_ERROR");
+        verify(processRunner, never()).run(any(), any(), any(), anyInt());
+    }
+
+    /**
+     * reportsDir 内部有指向外部文件的符号链接时，清理只删除链接本身，
+     * 不跟随链接删除外部目标文件。
+     */
+    @Test
+    void cleanSurefireReports_internalSymlink_deletesLinkOnly() throws IOException {
+        // 尝试创建符号链接，若不支持则跳过
+        Path externalFile = tempDir.resolve("external-secret.txt");
+        Files.writeString(externalFile, "important external data");
+
+        Path reportsDir = tempDir.resolve("target").resolve("surefire-reports");
+        Files.createDirectories(reportsDir);
+        // 同时放一个普通报告文件
+        Files.writeString(reportsDir.resolve("normal-report.txt"), "Tests run: 5, Failures: 1");
+
+        Path internalLink = reportsDir.resolve("link-to-external.txt");
+        try {
+            Files.createSymbolicLink(internalLink, externalFile);
+        } catch (IOException e) {
+            Assumptions.assumeTrue(false, "当前系统不支持创建符号链接，跳过测试");
+            return;
+        }
+
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenReturn(new ProcessResult(0, "ok", "", false, 50L));
+
+        service.executeTests("p1");
+
+        // 符号链接应被删除
+        assertFalse(Files.exists(internalLink), "内部符号链接应被删除");
+        // 外部目标文件应仍然存在
+        assertTrue(Files.exists(externalFile), "符号链接指向的外部文件不应被删除");
+        // 普通报告文件应被清理
+        assertFalse(Files.exists(reportsDir.resolve("normal-report.txt")),
+                "普通报告文件应被清理");
+    }
+
+    /**
+     * 普通报告目录（非符号链接）可以正常清理，清理后 Maven 正常执行。
+     */
+    @Test
+    void executeTests_normalReportsDir_cleanedAndExecuted() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+
+        Path reportsDir = tempDir.resolve("target").resolve("surefire-reports");
+        Files.createDirectories(reportsDir);
+        Files.writeString(reportsDir.resolve("old-report.txt"),
+                "Tests run: 10, Failures: 8, Errors: 1, Skipped: 1");
+
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(runWithReport(
+                        new ProcessResult(0, "BUILD SUCCESS", "", false, 500L),
+                        "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n"));
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        // 旧报告被清理，新报告生效
+        assertTrue(result.isSuccess());
+        assertEquals("PASSED", result.getStatus());
+        assertEquals(3, result.getTotalTests());
+        // 旧报告文件已被删除
+        assertFalse(Files.exists(reportsDir.resolve("old-report.txt")),
+                "旧报告文件应在执行前被清理");
+        verify(processRunner, atLeastOnce()).run(eq(tempDir), any(String[].class), any(), anyInt());
     }
 }
