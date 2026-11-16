@@ -16,6 +16,7 @@ import org.mockito.stubbing.Answer;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -363,8 +364,8 @@ class TestExecutionServiceImplTest {
 
         service.executeTests("p1");
 
-        // 符号链接应被删除
-        assertFalse(Files.exists(internalLink), "内部符号链接应被删除");
+        // 符号链接本身应被删除（NOFOLLOW_LINKS 确认链接本身不存在，而非仅目标不可访问）
+        assertFalse(Files.exists(internalLink, LinkOption.NOFOLLOW_LINKS), "内部符号链接应被删除");
         // 外部目标文件应仍然存在
         assertTrue(Files.exists(externalFile), "符号链接指向的外部文件不应被删除");
         // 普通报告文件应被清理
