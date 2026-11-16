@@ -214,6 +214,7 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
             String retryStatus = retryResult.getStatus();
             if ("PASSED".equals(retryStatus)) {
                 success = true;
+                lastResult = retryResult;
                 records.add(new RepairRecord(retry,
                         feedback != null ? feedback.getFailureType().name() : "UNKNOWN",
                         feedback != null ? feedback.getSummary() : "",

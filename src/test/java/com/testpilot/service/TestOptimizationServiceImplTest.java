@@ -205,6 +205,83 @@ class TestOptimizationServiceImplTest {
         verify(llmService, times(2)).chat(anyString());
     }
 
+    // 5a. 初始 COMPILE_ERROR，修复后 PASSED：finalExecutionResult 必须为最后一次执行结果(PASSED)，
+    //     initialExecutionResult 保留第一次结果(COMPILE_ERROR)，optimizationSuccess 与 final 一致
+    @Test
+    void optimize_compileErrorThenPassed_finalResultIsLastExecution() throws IOException {
+        setupCommonMocks();
+        writeExistingTest(validJUnit4Test());
+        TestExecutionResult compileError = result("COMPILE_ERROR", false, 1, 0,
+                "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol\n"
+                        + "[ERROR] symbol: class Foo");
+        TestExecutionResult passed = result("PASSED", true, 0, 0, "BUILD SUCCESS");
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(compileError)
+                .thenReturn(passed);
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        // 初始执行结果保留
+        assertEquals("COMPILE_ERROR", r.getInitialExecutionResult().getStatus(),
+                "initialExecutionResult 必须保留第一次执行结果");
+        // 最终执行结果必须为最后一次真实执行结果
+        assertEquals("PASSED", r.getFinalExecutionResult().getStatus(),
+                "finalExecutionResult 必须返回最后一次执行结果(PASSED)");
+        // success 与 final 一致
+        assertTrue(r.isOptimizationSuccess(), "optimizationSuccess 必须与 finalExecutionResult 一致");
+        assertEquals(1, r.getRetryCount());
+        // 修复记录中的执行结果也是 PASSED
+        assertEquals("PASSED", r.getRepairRecords().get(0).getExecutionResult().getStatus());
+    }
+
+    // 5b. 初始 FAILED，修复后 PASSED：finalExecutionResult 为 PASSED，initialExecutionResult 为 FAILED
+    @Test
+    void optimize_failureThenPassed_finalResultIsPassed() throws IOException {
+        setupCommonMocks();
+        writeExistingTest(validJUnit4Test());
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(result("FAILED", false, 1, 1, ""))
+                .thenReturn(result("PASSED", true, 0, 0, "BUILD SUCCESS"));
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        assertEquals("FAILED", r.getInitialExecutionResult().getStatus());
+        assertEquals("PASSED", r.getFinalExecutionResult().getStatus());
+        assertTrue(r.isOptimizationSuccess());
+    }
+
+    // 5c. 多次修复后仍失败：finalExecutionResult 必须为最后一次执行结果(FAILED)，
+    //      optimizationSuccess=false 与 final 一致，initialExecutionResult 保留第一次结果
+    @Test
+    void optimize_twoRetriesStillFail_finalResultIsLastFailure() throws IOException {
+        setupCommonMocks();
+        writeExistingTest(validJUnit4Test());
+        when(testExecutionService.executeTests(anyString()))
+                .thenReturn(result("COMPILE_ERROR", false, 1, 0,
+                        "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol"))
+                .thenReturn(result("COMPILE_ERROR", false, 1, 0,
+                        "[ERROR] /home/user/project/src/test/java/com/example/CalculatorTest.java:[10,13] cannot find symbol"))
+                .thenReturn(result("FAILED", false, 1, 1, ""));
+        when(llmService.chat(anyString())).thenReturn("```java\n" + validJUnit4Test() + "```");
+
+        TestOptimizationResult r = optimizationService.optimize("pid", buildRequest());
+
+        // 初始执行结果保留
+        assertEquals("COMPILE_ERROR", r.getInitialExecutionResult().getStatus(),
+                "initialExecutionResult 必须保留第一次执行结果");
+        // 最终执行结果必须为最后一次真实执行结果(FAILED)
+        assertEquals("FAILED", r.getFinalExecutionResult().getStatus(),
+                "finalExecutionResult 必须返回最后一次执行结果(FAILED)");
+        // success 与 final 一致：FAILED 不应为 success
+        assertFalse(r.isOptimizationSuccess(), "optimizationSuccess 必须与 finalExecutionResult 一致");
+        assertEquals(2, r.getRetryCount());
+        assertEquals(2, r.getRepairRecords().size());
+        // 第二条修复记录的执行结果是最后一次 FAILED
+        assertEquals("FAILED", r.getRepairRecords().get(1).getExecutionResult().getStatus());
+    }
+
     // 6. Maven 启动失败，不调用 LLM
     @Test
     void optimize_mavenError_doesNotCallLLM() throws IOException {
