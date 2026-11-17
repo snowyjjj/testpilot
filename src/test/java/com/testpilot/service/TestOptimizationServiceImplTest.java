@@ -47,7 +47,7 @@ class TestOptimizationServiceImplTest {
         projectService = mock(ProjectService.class);
         testExecutionService = mock(TestExecutionService.class);
         llmService = mock(LLMService.class);
-        optimizationService = new TestOptimizationServiceImpl(projectService, testExecutionService, llmService);
+        optimizationService = new TestOptimizationServiceImpl(projectService, testExecutionService, llmService, new com.testpilot.utils.ProjectExecutionLock());
 
         // 写入 JUnit 4 pom.xml 供 JUnitDetector 检测
         writePom(tempDir);

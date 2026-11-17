@@ -48,7 +48,7 @@ class TestExecutionServiceImplTest {
     void setUp() {
         projectService = mock(ProjectService.class);
         processRunner = mock(MavenProcessRunner.class);
-        service = new TestExecutionServiceImpl(projectService, processRunner);
+        service = new TestExecutionServiceImpl(projectService, processRunner, new com.testpilot.utils.ProjectExecutionLock());
     }
 
     private void writeSurefireReport(Path mavenDir, String content) throws IOException {

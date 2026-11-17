@@ -15,6 +15,7 @@ import com.testpilot.service.TestExecutionService;
 import com.testpilot.service.TestOptimizationService;
 import com.testpilot.utils.ExecutionFeedbackExtractor;
 import com.testpilot.utils.JUnitDetector;
+import com.testpilot.utils.ProjectExecutionLock;
 import com.testpilot.utils.PromptBuilder;
 import com.testpilot.utils.TestFileManager;
 import lombok.RequiredArgsConstructor;
@@ -24,8 +25,6 @@ import org.springframework.stereotype.Service;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 测试优化服务实现：执行 → 失败反馈 → LLM 修复 → 重新执行 的有限轮次闭环。
@@ -43,9 +42,7 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
     private final ProjectService projectService;
     private final TestExecutionService testExecutionService;
     private final LLMService llmService;
-
-    /** 正在优化的项目集合，防止同一项目并发修改测试文件 */
-    private final Set<String> optimizingProjects = ConcurrentHashMap.newKeySet();
+    private final ProjectExecutionLock projectExecutionLock;
 
     @Override
     public TestOptimizationResult optimize(String projectId, TestOptimizationRequest request) {
@@ -56,15 +53,19 @@ public class TestOptimizationServiceImpl implements TestOptimizationService {
             throw new BusinessException(400, "请求体不能为空");
         }
 
-        // 并发控制：同一项目不允许同时优化
-        if (!optimizingProjects.add(projectId)) {
+        // 并发控制：同一项目不允许同时优化。使用共享 ProjectExecutionLock，
+        // 优化流程全程持锁（跨越多次 LLM 调用、文件修改、内部 executeTests），
+        // 普通测试执行和后续覆盖率执行均无法获取锁。
+        // 内部调用 testExecutionService.executeTests(projectId) 时，
+        // 同线程重入 ReentrantLock，不会被自己判定为并发冲突。
+        if (!projectExecutionLock.tryLock(projectId)) {
             throw new BusinessException(409, "该项目正在执行测试优化，请稍后重试");
         }
 
         try {
             return doOptimize(projectId, request);
         } finally {
-            optimizingProjects.remove(projectId);
+            projectExecutionLock.unlock(projectId);
         }
     }
 

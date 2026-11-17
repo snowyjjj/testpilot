@@ -13,6 +13,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import com.testpilot.utils.ProjectExecutionLock;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -20,8 +22,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 /**
@@ -38,9 +38,7 @@ public class TestExecutionServiceImpl implements TestExecutionService {
 
     private final ProjectService projectService;
     private final MavenProcessRunner mavenProcessRunner;
-
-    /** 正在执行的项目集合，用于防止同一项目并发执行 */
-    private final Set<String> runningProjects = ConcurrentHashMap.newKeySet();
+    private final ProjectExecutionLock projectExecutionLock;
 
     @Value("${testpilot.maven.timeout-seconds:120}")
     private int timeoutSeconds;
@@ -54,15 +52,16 @@ public class TestExecutionServiceImpl implements TestExecutionService {
             throw new BusinessException(400, "项目 ID 不能为空");
         }
 
-        // 并发控制：同一项目不允许同时执行
-        if (!runningProjects.add(projectId)) {
+        // 并发控制：同一项目不允许同时执行；使用共享 ReentrantLock，
+        // 支持测试优化流程全程持锁期间内部调用 executeTests 时的同线程重入
+        if (!projectExecutionLock.tryLock(projectId)) {
             throw new BusinessException(409, "该项目正在执行测试，请稍后重试");
         }
 
         try {
             return doExecute(projectId);
         } finally {
-            runningProjects.remove(projectId);
+            projectExecutionLock.unlock(projectId);
         }
     }
 
