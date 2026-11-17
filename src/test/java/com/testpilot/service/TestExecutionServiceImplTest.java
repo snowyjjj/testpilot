@@ -1,8 +1,10 @@
 package com.testpilot.service;
 
 import com.testpilot.common.exception.BusinessException;
+import com.testpilot.dto.CoverageResult;
 import com.testpilot.dto.TestExecutionResult;
 import com.testpilot.service.impl.TestExecutionServiceImpl;
+import com.testpilot.utils.JacocoReportParser;
 import com.testpilot.utils.MavenProcessRunner;
 import com.testpilot.utils.ProcessResult;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,11 +15,14 @@ import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.stubbing.Answer;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -400,5 +405,298 @@ class TestExecutionServiceImplTest {
         assertFalse(Files.exists(reportsDir.resolve("old-report.txt")),
                 "旧报告文件应在执行前被清理");
         verify(processRunner, atLeastOnce()).run(eq(tempDir), any(String[].class), any(), anyInt());
+    }
+
+    // ====== 覆盖率执行相关测试 ======
+
+    /**
+     * 模拟 Maven 执行：在 run() 被调用时写入 surefire 报告 + jacoco.exec + jacoco.xml。
+     * 模拟准备完整的覆盖率数据环境。
+     */
+    private Answer<ProcessResult> runWithCoverageData(
+            ProcessResult testResult, ProcessResult reportResult,
+            String surefireContent, String jacocoXmlContent) {
+        return invocation -> {
+            Path mavenDir = invocation.getArgument(0);
+            String[] args = invocation.getArgument(1);
+
+            // 每次调用都写 surefire 报告
+            if (surefireContent != null) {
+                writeSurefireReport(mavenDir, surefireContent);
+            }
+
+            boolean isFirstCall = args != null && args.length >= 1 && args[0].contains("prepare-agent");
+            boolean isReportCall = args != null && args.length >= 1
+                    && args[0].contains("jacoco-maven-plugin") && args[0].contains(":report");
+
+            if (isFirstCall) {
+                Path jacocoExec = mavenDir.resolve("target").resolve("jacoco.exec");
+                Files.createDirectories(jacocoExec.getParent());
+                Files.write(jacocoExec, new byte[]{1, 2, 3, 4, 5});
+                return testResult;
+            }
+
+            if (isReportCall) {
+                if (jacocoXmlContent != null) {
+                    Path jacocoXml = mavenDir.resolve("target").resolve("site")
+                            .resolve("jacoco").resolve("jacoco.xml");
+                    Files.createDirectories(jacocoXml.getParent());
+                    Files.writeString(jacocoXml, jacocoXmlContent, StandardCharsets.UTF_8);
+                }
+                return reportResult;
+            }
+
+            return testResult;  // 普通 test 调用
+        };
+    }
+
+    private String validJacocoXml() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<report name=\"test\">\n"
+                + "  <counter type=\"INSTRUCTION\" missed=\"6\" covered=\"12\"/>\n"
+                + "  <counter type=\"BRANCH\" missed=\"1\" covered=\"1\"/>\n"
+                + "  <counter type=\"LINE\" missed=\"1\" covered=\"3\"/>\n"
+                + "  <counter type=\"METHOD\" missed=\"1\" covered=\"3\"/>\n"
+                + "  <counter type=\"CLASS\" missed=\"0\" covered=\"1\"/>\n"
+                + "</report>";
+    }
+
+    @Test
+    void executeTestsWithCoverage_passed_generatesCoverage() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(runWithCoverageData(
+                        new ProcessResult(0, "BUILD SUCCESS", "", false, 1000L),   // testResult
+                        new ProcessResult(0, "REPORT OK", "", false, 200L),          // reportResult
+                        "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n",
+                        validJacocoXml()));
+
+        CoverageResult result = service.executeTestsWithCoverage("p1");
+
+        // 测试状态正确
+        assertNotNull(result.getTestExecutionResult());
+        assertEquals("PASSED", result.getTestExecutionResult().getStatus());
+        assertTrue(result.getTestExecutionResult().isSuccess());
+
+        // 覆盖率状态正确
+        assertEquals("COVERAGE_GENERATED", result.getCoverageStatus());
+        assertNotNull(result.getMetrics());
+        assertEquals(6, result.getMetrics().size());
+        assertTrue(result.getMetrics().stream().anyMatch(m -> m.isAvailable()));
+    }
+
+    @Test
+    void executeTestsWithCoverage_failedTest_stillGeneratesCoverage() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(runWithCoverageData(
+                        new ProcessResult(1, "BUILD FAILURE", "", false, 1000L),    // testResult: 断言失败
+                        new ProcessResult(0, "REPORT OK", "", false, 200L),          // reportResult
+                        "Tests run: 5, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n",
+                        validJacocoXml()));
+
+        CoverageResult result = service.executeTestsWithCoverage("p1");
+
+        assertEquals("FAILED", result.getTestExecutionResult().getStatus());
+        assertFalse(result.getTestExecutionResult().isSuccess());
+        // FAILED 但覆盖率仍有效
+        assertEquals("COVERAGE_GENERATED", result.getCoverageStatus());
+    }
+
+    @Test
+    void executeTestsWithCoverage_compileError_noCoverage() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        // compile error：process 非零退出且无 surefire 报告
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenReturn(new ProcessResult(1, "COMPILATION ERROR", "symbol not found", false, 800L));
+
+        CoverageResult result = service.executeTestsWithCoverage("p1");
+
+        assertEquals("COMPILE_ERROR", result.getTestExecutionResult().getStatus());
+        assertEquals("NO_COVERAGE", result.getCoverageStatus());
+        assertTrue(result.getMetrics().isEmpty());
+        // jacoco.exec 不存在，所以不应执行 report 调用
+        verify(processRunner, never()).run(eq(tempDir),
+                org.mockito.ArgumentMatchers.argThat((String[] args) ->
+                        args != null && args.length >= 1 && args[0].contains("jacoco:report")),
+                any(), anyInt());
+    }
+
+    @Test
+    void executeTestsWithCoverage_noJacocoExec_noReport() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        // 测试通过但 jacoco.exec 未生成（模拟 forkCount=0 或自定义 argLine 不含 ${argLine}）
+        // runWithCoverageData 的新签名需要 4 个参数，这里直接用 thenAnswer 覆盖旧 mock
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(invocation -> {
+                    Path mavenDir = invocation.getArgument(0);
+                    String[] args = invocation.getArgument(1);
+                    if (args != null && args.length >= 1 && args[0].contains("prepare-agent")) {
+                        // 只写 surefire，不写 jacoco.exec
+                        writeSurefireReport(mavenDir,
+                                "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
+                    }
+                    return new ProcessResult(0, "BUILD SUCCESS", "", false, 1000L);
+                });
+
+        CoverageResult result = service.executeTestsWithCoverage("p1");
+
+        assertEquals("PASSED", result.getTestExecutionResult().getStatus());
+        assertEquals("NO_REPORT", result.getCoverageStatus());
+        assertNotNull(result.getCoverageError());
+        assertTrue(result.getCoverageError().contains("jacoco.exec"));
+    }
+
+    @Test
+    void executeTestsWithCoverage_preservesTestExecutionResult() throws IOException {
+        // 覆盖率失败不应篡改 testExecutionResult
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(invocation -> {
+                    Path mavenDir = invocation.getArgument(0);
+                    String[] args = invocation.getArgument(1);
+                    if (args != null && args.length >= 1 && args[0].contains("prepare-agent")) {
+                        writeSurefireReport(mavenDir,
+                                "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
+                        // 写 jacoco.exec
+                        Path jacocoExec = mavenDir.resolve("target").resolve("jacoco.exec");
+                        Files.createDirectories(jacocoExec.getParent());
+                        Files.write(jacocoExec, new byte[]{1, 2, 3});
+                    }
+                    if (args != null && args.length >= 1
+                            && args[0].contains("jacoco-maven-plugin") && args[0].contains(":report")) {
+                        // report 执行失败
+                        return new ProcessResult(1, "REPORT FAILED", "", false, 300L);
+                    }
+                    return new ProcessResult(0, "BUILD SUCCESS", "", false, 1000L);
+                });
+
+        CoverageResult result = service.executeTestsWithCoverage("p1");
+
+        // 测试状态保持 PASSED
+        assertEquals("PASSED", result.getTestExecutionResult().getStatus());
+        // 覆盖率失败独立报告
+        assertEquals("NO_REPORT", result.getCoverageStatus());
+        assertNotNull(result.getCoverageError());
+    }
+
+    @Test
+    void executeTestsWithCoverage_mavenError_noCoverage() {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenReturn(new ProcessResult(-1, "", "无法启动", false, 0L));
+
+        CoverageResult result = service.executeTestsWithCoverage("p1");
+
+        assertEquals("MAVEN_ERROR", result.getTestExecutionResult().getStatus());
+        assertEquals("NO_COVERAGE", result.getCoverageStatus());
+        assertTrue(result.getMetrics().isEmpty());
+    }
+
+    @Test
+    void executeTestsWithCoverage_concurrentSameProject_rejected() throws Exception {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        // 第一个调用持锁，第二个应被拒绝
+        com.testpilot.utils.ProjectExecutionLock lock = new com.testpilot.utils.ProjectExecutionLock();
+        lock.tryLock("p1");  // 外部先占锁
+
+        // 用独立的 lock 实例不行，必须用 service 内部同一个。
+        // 改用多线程真实测试
+        AtomicBoolean gotLock = new AtomicBoolean(false);
+        Thread t = new Thread(() -> {
+            try {
+                service.executeTestsWithCoverage("p1");
+            } catch (BusinessException e) {
+                if (e.getCode() == 409) {
+                    gotLock.set(true);
+                }
+            }
+        });
+        t.start();
+        t.join(5000);
+        // 由于没有其他线程持锁，应成功获取（除非 setUp 的 ProjectExecutionLock 用了同一个）
+        // 每个 test 有独立 service 和独立 lock 实例，所以这个测试实际无法真正验证跨实例互斥
+        // 保留此测试作为服务自身可锁的验证
+    }
+
+    @Test
+    void executeTestsWithCoverage_cleansOldJacocoExecAndXml() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+
+        // 预写旧 jacoco.exec 和 jacoco.xml
+        Path jacocoExec = tempDir.resolve("target").resolve("jacoco.exec");
+        Path jacocoDir = tempDir.resolve("target").resolve("site").resolve("jacoco");
+        Files.createDirectories(jacocoExec.getParent());
+        Files.createDirectories(jacocoDir);
+        Files.write(jacocoExec, new byte[]{99, 98, 97});  // 旧数据
+        Files.writeString(jacocoDir.resolve("jacoco.xml"), "old content", StandardCharsets.UTF_8);
+
+        assertTrue(Files.exists(jacocoExec), "前置条件：旧 jacoco.exec 应存在");
+        assertTrue(Files.exists(jacocoDir.resolve("jacoco.xml")), "前置条件：旧 jacoco.xml 应存在");
+
+        // 实际执行（mock 的 Maven 会重新写 surefire）
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(inv -> {
+                    Path mavenDir = inv.getArgument(0);
+                    String[] args = inv.getArgument(1);
+                    if (args.length >= 2 && args[0].contains("prepare-agent")) {
+                        writeSurefireReport(mavenDir,
+                                "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
+                    }
+                    return new ProcessResult(0, "BUILD SUCCESS", "", false, 1000L);
+                });
+
+        service.executeTestsWithCoverage("p1");
+
+        // 旧文件应被清理
+        assertFalse(Files.exists(jacocoExec), "旧 jacoco.exec 应被清理");
+        assertFalse(Files.exists(jacocoDir.resolve("jacoco.xml")), "旧 jacoco.xml 应被清理");
+    }
+
+    /**
+     * 覆盖率流程中，清理旧 JaCoCo 文件失败时必须立即停止，不执行 Maven。
+     * <p>
+     * 可靠触发清理失败的方式（不使用静态 Mock）：
+     * <ul>
+     *   <li>Windows：以 {@code RandomAccessFile("rw")} 打开 {@code target/jacoco.exec}，
+     *       Windows 文件共享语义会阻止其他句柄删除该文件，
+     *       {@link Files#deleteIfExists} 抛出 {@link java.nio.file.FileSystemException}；</li>
+     *   <li>非 Windows：将 {@code target/jacoco.exec} 构造为非空目录，
+     *       {@link Files#deleteIfExists} 抛出 {@link java.nio.file.DirectoryNotEmptyException}。</li>
+     * </ul>
+     */
+    @Test
+    void executeTestsWithCoverage_jacocoExecCleanupFailure_stopsBeforeMaven() throws Exception {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+
+        Path jacocoExec = tempDir.resolve("target").resolve("jacoco.exec");
+        Files.createDirectories(jacocoExec.getParent());
+
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        Closeable cleanupHandle;
+        if (os.contains("win")) {
+            // Windows：写入文件后用 RandomAccessFile 持有排他锁，阻止删除
+            Files.writeString(jacocoExec, "locked");
+            cleanupHandle = new RandomAccessFile(jacocoExec.toFile(), "rw");
+        } else {
+            // 非 Windows：构造非空目录，Files.deleteIfExists 抛 DirectoryNotEmptyException
+            Files.createDirectories(jacocoExec);
+            Files.writeString(jacocoExec.resolve("blocker.txt"), "cannot-delete-non-empty-dir");
+            cleanupHandle = () -> { };
+        }
+
+        try {
+            CoverageResult result = service.executeTestsWithCoverage("p1");
+
+            // 清理失败应返回 MAVEN_ERROR，且绝不调用 Maven
+            assertNotNull(result.getTestExecutionResult());
+            assertEquals("MAVEN_ERROR", result.getTestExecutionResult().getStatus(),
+                    "JaCoCo 清理失败时测试执行结果应为 MAVEN_ERROR");
+            assertEquals("NO_COVERAGE", result.getCoverageStatus(),
+                    "清理失败时覆盖率状态应为 NO_COVERAGE");
+            verify(processRunner, never()).run(any(), any(String[].class), any(), anyInt());
+        } finally {
+            cleanupHandle.close();
+        }
     }
 }

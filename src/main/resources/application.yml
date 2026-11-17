@@ -19,6 +19,9 @@ testpilot:
     timeout-seconds: 120
     # 日志最大保留字符数
     max-log-length: 51200
+  jacoco:
+    # JaCoCo Maven 插件版本（命令行调用，不修改用户 pom.xml）
+    version: 0.8.11
   llm:
     base-url: https://ws-ksj13y5j5qjkb8jg.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     model: qwen-plus
