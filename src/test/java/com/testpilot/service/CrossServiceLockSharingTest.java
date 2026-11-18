@@ -169,6 +169,13 @@ class CrossServiceLockSharingTest {
     /**
      * 启动另一个线程尝试获取指定 projectId 的锁，设置超时避免永久阻塞。
      * 成功获取后立即释放，由主线程通过断言确认结果。
+     * <p>
+     * 并发安全要点：
+     * <ul>
+     *   <li>checker 线程内部锁获取后 unlock 必须在 finally 中，防止锁泄露。</li>
+     *   <li>主线程断言失败时，done.countDown() 必须执行以确保 checker 线程能退出。</li>
+     *   <li>checker 线程异常通过 error AtomicReference 传递，主线程检测后抛出 AssertionError。</li>
+     * </ul>
      */
     private void verifyLockReleasedByAnotherThread(String projectId) throws InterruptedException {
         CountDownLatch acquired = new CountDownLatch(1);
@@ -177,29 +184,42 @@ class CrossServiceLockSharingTest {
         AtomicReference<Throwable> error = new AtomicReference<>();
 
         Thread checker = new Thread(() -> {
+            boolean locked = false;
             try {
                 boolean ok = sharedLock.tryLock(projectId);
                 result.set(ok);
                 if (ok) {
+                    locked = true;
                     acquired.countDown();
-                    // 主线程确认后再释放
-                    done.await(5, TimeUnit.SECONDS);
-                    sharedLock.unlock(projectId);
+                    // 主线程确认后再释放；若被中断则恢复标志
+                    try {
+                        done.await(5, TimeUnit.SECONDS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             } catch (Throwable t) {
                 error.set(t);
+            } finally {
+                if (locked) {
+                    sharedLock.unlock(projectId);
+                }
             }
         });
         checker.start();
 
-        assertTrue(acquired.await(5, TimeUnit.SECONDS),
-                "另一个线程应在 5s 内成功获取锁（否则说明锁未被释放）");
-        assertEquals(Boolean.TRUE, result.get(), "另一个线程 tryLock 应返回 true");
-        if (error.get() != null) {
-            throw new AssertionError("检查线程发生异常", error.get());
+        boolean acquiredOk = acquired.await(5, TimeUnit.SECONDS);
+        try {
+            assertTrue(acquiredOk,
+                    "另一个线程应在 5s 内成功获取锁（否则说明锁未被释放）");
+            assertEquals(Boolean.TRUE, result.get(), "另一个线程 tryLock 应返回 true");
+            if (error.get() != null) {
+                throw new AssertionError("检查线程发生异常", error.get());
+            }
+        } finally {
+            // 必须确保 checker 线程能退出，无论断言是否失败
+            done.countDown();
+            checker.join(5000);
         }
-
-        done.countDown();
-        checker.join(5000);
     }
 }
