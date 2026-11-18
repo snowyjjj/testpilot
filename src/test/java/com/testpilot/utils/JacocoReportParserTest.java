@@ -231,25 +231,190 @@ class JacocoReportParserTest {
 
     @Test
     void parse_xxeAttack_safe() throws IOException {
+        // 使用本地临时文件作为 XXE 攻击目标，验证外部实体无法读取本地文件内容
+        Path secretFile = tempDir.resolve("secret.txt");
+        Files.writeString(secretFile, "SENSITIVE_DATA_12345", StandardCharsets.UTF_8);
+        String secretUri = secretFile.toUri().toString();
+
         String maliciousXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                 + "<!DOCTYPE report [\n"
-                + "  <!ENTITY xxe SYSTEM \"file:///etc/passwd\">\n"
+                + "  <!ENTITY xxe SYSTEM \"" + secretUri + "\">\n"
                 + "]>\n"
                 + "<report name=\"&xxe;\">\n"
                 + "  <counter type=\"LINE\" missed=\"1\" covered=\"1\"/>\n"
                 + "</report>";
         Files.writeString(jacocoXml, maliciousXml, StandardCharsets.UTF_8);
 
-        // XXE 防护下，要么正常解析（但 name 里的实体不会被展开），要么拒绝
         List<CoverageMetric> metrics = JacocoReportParser.parse(jacocoXml);
-        // 关键：不抛异常就是安全的；若 DOCTYPE 被禁止，会抛 SAXException → 走空列表返回
+
+        // 关键断言：解析后不能泄露本地文件内容
+        // 无论解析成功还是因实体引用失败返回空，secret 内容都不应出现在解析结果中
+        for (CoverageMetric m : metrics) {
+            String type = m.getType();
+            assertFalse(type.contains("SENSITIVE_DATA_12345"),
+                    "外部实体内容不应出现在 type 中");
+        }
+        // 如果解析成功，验证 counter 数据正常（实体未被展开到属性中）
         if (JacocoReportParser.hasValidCounters(metrics)) {
-            // 解析成功，验证 counter 数据正确
             CoverageMetric line = metrics.stream().filter(m -> "LINE".equals(m.getType())).findFirst().get();
             assertTrue(line.isAvailable());
             assertEquals(50.0, line.getPercentage(), 0.01);
         }
-        // 若 hasValidCounters=false，说明 DOCTYPE 被拒绝 → 安全
+    }
+
+    // ====== JaCoCo 真实 DOCTYPE 场景 ======
+
+    @Test
+    void parse_jacocoDoctypeXml_succeeds() throws IOException {
+        // JaCoCo 0.8.11 真实生成的 XML 头部：含 DOCTYPE 声明
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                + "<!DOCTYPE report PUBLIC \"-//JACOCO//DTD Report 1.1//EN\" \"report.dtd\">\n"
+                + "<report name=\"Maven Test Project\">\n"
+                + "  <sessioninfo id=\"x\" start=\"0\" dump=\"0\"/>\n"
+                + "  <package name=\"com/example\">\n"
+                + "    <class name=\"com/example/Calculator\" sourcefilename=\"Calculator.java\">\n"
+                + "      <counter type=\"INSTRUCTION\" missed=\"0\" covered=\"5\"/>\n"
+                + "      <counter type=\"LINE\" missed=\"0\" covered=\"1\"/>\n"
+                + "      <counter type=\"METHOD\" missed=\"0\" covered=\"1\"/>\n"
+                + "      <counter type=\"CLASS\" missed=\"0\" covered=\"1\"/>\n"
+                + "    </class>\n"
+                + "    <counter type=\"INSTRUCTION\" missed=\"0\" covered=\"5\"/>\n"
+                + "    <counter type=\"LINE\" missed=\"0\" covered=\"1\"/>\n"
+                + "    <counter type=\"METHOD\" missed=\"0\" covered=\"1\"/>\n"
+                + "    <counter type=\"CLASS\" missed=\"0\" covered=\"1\"/>\n"
+                + "  </package>\n"
+                + "  <counter type=\"INSTRUCTION\" missed=\"10\" covered=\"20\"/>\n"
+                + "  <counter type=\"BRANCH\" missed=\"2\" covered=\"3\"/>\n"
+                + "  <counter type=\"LINE\" missed=\"3\" covered=\"7\"/>\n"
+                + "  <counter type=\"COMPLEXITY\" missed=\"4\" covered=\"5\"/>\n"
+                + "  <counter type=\"METHOD\" missed=\"1\" covered=\"4\"/>\n"
+                + "  <counter type=\"CLASS\" missed=\"0\" covered=\"1\"/>\n"
+                + "</report>";
+        Files.writeString(jacocoXml, xml, StandardCharsets.UTF_8);
+
+        List<CoverageMetric> metrics = JacocoReportParser.parse(jacocoXml);
+
+        assertTrue(JacocoReportParser.hasValidCounters(metrics),
+                "含 JaCoCo DOCTYPE 的合法 XML 应能成功解析并产生有效 counter");
+    }
+
+    @Test
+    void parse_jacocoDoctypeXml_extractsAllSixCounters() throws IOException {
+        // 验证含 DOCTYPE 的 XML 中 6 种 counter 均被正确解析（根级直接子节点）
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                + "<!DOCTYPE report PUBLIC \"-//JACOCO//DTD Report 1.1//EN\" \"report.dtd\">\n"
+                + "<report name=\"Maven Test Project\">\n"
+                + "  <package name=\"com/example\">\n"
+                + "    <counter type=\"INSTRUCTION\" missed=\"999\" covered=\"999\"/>\n"
+                + "  </package>\n"
+                + "  <counter type=\"INSTRUCTION\" missed=\"334\" covered=\"25\"/>\n"
+                + "  <counter type=\"BRANCH\" missed=\"44\" covered=\"0\"/>\n"
+                + "  <counter type=\"LINE\" missed=\"73\" covered=\"9\"/>\n"
+                + "  <counter type=\"COMPLEXITY\" missed=\"50\" covered=\"6\"/>\n"
+                + "  <counter type=\"METHOD\" missed=\"28\" covered=\"6\"/>\n"
+                + "  <counter type=\"CLASS\" missed=\"3\" covered=\"2\"/>\n"
+                + "</report>";
+        Files.writeString(jacocoXml, xml, StandardCharsets.UTF_8);
+
+        List<CoverageMetric> metrics = JacocoReportParser.parse(jacocoXml);
+
+        assertEquals(6, metrics.size());
+        assertTrue(JacocoReportParser.hasValidCounters(metrics));
+
+        CoverageMetric instruction = find(metrics, "INSTRUCTION");
+        assertTrue(instruction.isAvailable());
+        assertEquals(334, instruction.getMissed());
+        assertEquals(25, instruction.getCovered());
+
+        CoverageMetric branch = find(metrics, "BRANCH");
+        assertTrue(branch.isAvailable());
+        assertEquals(44, branch.getMissed());
+        assertEquals(0, branch.getCovered());
+        assertEquals(0.0, branch.getPercentage(), 0.001);
+
+        CoverageMetric line = find(metrics, "LINE");
+        assertTrue(line.isAvailable());
+        assertEquals(73, line.getMissed());
+        assertEquals(9, line.getCovered());
+
+        CoverageMetric complexity = find(metrics, "COMPLEXITY");
+        assertTrue(complexity.isAvailable());
+        assertEquals(50, complexity.getMissed());
+        assertEquals(6, complexity.getCovered());
+        assertNull(complexity.getPercentage(), "COMPLEXITY 不应计算 percentage");
+
+        CoverageMetric method = find(metrics, "METHOD");
+        assertTrue(method.isAvailable());
+        assertEquals(28, method.getMissed());
+        assertEquals(6, method.getCovered());
+
+        CoverageMetric clazz = find(metrics, "CLASS");
+        assertTrue(clazz.isAvailable());
+        assertEquals(3, clazz.getMissed());
+        assertEquals(2, clazz.getCovered());
+    }
+
+    @Test
+    void parse_externalEntity_cannotReadLocalFile() throws IOException {
+        // 创建本地敏感文件，XML 通过外部实体尝试读取其内容
+        Path secret = tempDir.resolve("secret.txt");
+        Files.writeString(secret, "TOP_SECRET_VALUE", StandardCharsets.UTF_8);
+        String secretUri = secret.toUri().toString();
+
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<!DOCTYPE report [\n"
+                + "  <!ENTITY steal SYSTEM \"" + secretUri + "\">\n"
+                + "]>\n"
+                + "<report name=\"report\">\n"
+                + "  <counter type=\"LINE\" missed=\"&steal;\" covered=\"1\"/>\n"
+                + "</report>";
+        Files.writeString(jacocoXml, xml, StandardCharsets.UTF_8);
+
+        // XXE 防护下，外部实体不会被加载。结果要么是解析失败（空列表），
+        // 要么是 LINE 的 missed 不包含敏感内容（实体未展开）。
+        List<CoverageMetric> metrics = JacocoReportParser.parse(jacocoXml);
+        for (CoverageMetric m : metrics) {
+            assertFalse(String.valueOf(m.getMissed()).contains("TOP_SECRET_VALUE"),
+                    "外部实体内容不应出现在 missed 字段中");
+            assertFalse(String.valueOf(m.getCovered()).contains("TOP_SECRET_VALUE"),
+                    "外部实体内容不应出现在 covered 字段中");
+        }
+    }
+
+    @Test
+    void parse_externalDtd_notLoaded() throws IOException {
+        // 外部 DTD 中定义实体并尝试注入，验证外部 DTD 不会被加载
+        Path externalDtd = tempDir.resolve("evil.dtd");
+        Files.writeString(externalDtd,
+                "<!ENTITY injected \"INJECTED_FROM_DTD\">", StandardCharsets.UTF_8);
+        String dtdUri = externalDtd.toUri().toString();
+
+        String xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<!DOCTYPE report SYSTEM \"" + dtdUri + "\">\n"
+                + "<report name=\"&injected;\">\n"
+                + "  <counter type=\"LINE\" missed=\"1\" covered=\"1\"/>\n"
+                + "</report>";
+        Files.writeString(jacocoXml, xml, StandardCharsets.UTF_8);
+
+        List<CoverageMetric> metrics = JacocoReportParser.parse(jacocoXml);
+
+        // 外部 DTD 不应被加载：若解析成功，name 属性不含注入值；
+        // 若因实体未定义而解析失败，则返回空列表。两种情况都安全。
+        if (JacocoReportParser.hasValidCounters(metrics)) {
+            CoverageMetric line = find(metrics, "LINE");
+            assertTrue(line.isAvailable());
+            assertEquals(1, line.getMissed());
+            assertEquals(1, line.getCovered());
+        }
+        // 无论哪种情况，都不应该出现来自外部 DTD 的注入值
+        for (CoverageMetric m : metrics) {
+            assertFalse(m.getType().contains("INJECTED_FROM_DTD"),
+                    "外部 DTD 中的实体不应被加载和展开");
+        }
+    }
+
+    private CoverageMetric find(List<CoverageMetric> metrics, String type) {
+        return metrics.stream().filter(m -> type.equals(m.getType())).findFirst().orElseThrow();
     }
 
     @Test

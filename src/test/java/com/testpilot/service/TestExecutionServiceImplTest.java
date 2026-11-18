@@ -596,27 +596,74 @@ class TestExecutionServiceImplTest {
     @Test
     void executeTestsWithCoverage_concurrentSameProject_rejected() throws Exception {
         when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
-        // 第一个调用持锁，第二个应被拒绝
-        com.testpilot.utils.ProjectExecutionLock lock = new com.testpilot.utils.ProjectExecutionLock();
-        lock.tryLock("p1");  // 外部先占锁
+        // 第一个覆盖率调用持锁期间阻塞，第二个应被拒绝（409）
+        AtomicBoolean firstDone = new AtomicBoolean(false);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer((Answer<ProcessResult>) invocation -> {
+                    Thread.sleep(300);
+                    firstDone.set(true);
+                    return new ProcessResult(0, "ok", "", false, 300L);
+                });
 
-        // 用独立的 lock 实例不行，必须用 service 内部同一个。
-        // 改用多线程真实测试
-        AtomicBoolean gotLock = new AtomicBoolean(false);
-        Thread t = new Thread(() -> {
-            try {
-                service.executeTestsWithCoverage("p1");
-            } catch (BusinessException e) {
-                if (e.getCode() == 409) {
-                    gotLock.set(true);
-                }
-            }
-        });
-        t.start();
-        t.join(5000);
-        // 由于没有其他线程持锁，应成功获取（除非 setUp 的 ProjectExecutionLock 用了同一个）
-        // 每个 test 有独立 service 和独立 lock 实例，所以这个测试实际无法真正验证跨实例互斥
-        // 保留此测试作为服务自身可锁的验证
+        Thread t1 = new Thread(() -> service.executeTestsWithCoverage("p1"));
+        t1.start();
+        Thread.sleep(100); // 确保 t1 已进入执行并持锁
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> service.executeTestsWithCoverage("p1"));
+        assertEquals(409, ex.getCode());
+
+        t1.join();
+        assertTrue(firstDone.get());
+    }
+
+    @Test
+    void executeTests_holdingLock_blocksCoverageExecution() throws Exception {
+        // 证明普通测试执行与覆盖率执行共用同一把 ProjectExecutionLock：
+        // 普通测试持锁期间，覆盖率执行应被拒绝（409）。
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        AtomicBoolean firstDone = new AtomicBoolean(false);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer((Answer<ProcessResult>) invocation -> {
+                    Thread.sleep(300);
+                    firstDone.set(true);
+                    return new ProcessResult(0, "ok", "", false, 300L);
+                });
+
+        Thread t1 = new Thread(() -> service.executeTests("p1"));
+        t1.start();
+        Thread.sleep(100);
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> service.executeTestsWithCoverage("p1"));
+        assertEquals(409, ex.getCode());
+
+        t1.join();
+        assertTrue(firstDone.get());
+    }
+
+    @Test
+    void executeTestsWithCoverage_holdingLock_blocksNormalExecution() throws Exception {
+        // 反向证明：覆盖率执行持锁期间，普通测试执行应被拒绝（409）。
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        AtomicBoolean firstDone = new AtomicBoolean(false);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer((Answer<ProcessResult>) invocation -> {
+                    Thread.sleep(300);
+                    firstDone.set(true);
+                    return new ProcessResult(0, "ok", "", false, 300L);
+                });
+
+        Thread t1 = new Thread(() -> service.executeTestsWithCoverage("p1"));
+        t1.start();
+        Thread.sleep(100);
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> service.executeTests("p1"));
+        assertEquals(409, ex.getCode());
+
+        t1.join();
+        assertTrue(firstDone.get());
     }
 
     @Test

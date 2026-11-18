@@ -10,6 +10,7 @@ import org.w3c.dom.NodeList;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -24,7 +25,8 @@ import java.util.List;
  *   <li>只读取根 {@code <report>} 元素直接子级的 {@code <counter>}，
  *       不累计 package/class/method 层级的 counter，避免重复计数。</li>
  *   <li>对 XML 文件使用 NOFOLLOW_LINKS 检查，拒绝符号链接。</li>
- *   <li>XXE 防护（同 SurefireReportParser）。</li>
+ *   <li>XXE 防护：禁用外部实体、外部 DTD、XInclude，并关闭实体引用展开；
+ *       不使用 disallow-doctype-decl，因为 JaCoCo XML 含合法 DOCTYPE 声明。</li>
  *   <li>三态 percentage：missed+covered=0 时 percentage=null（无统计意义）；
  *       available=false 表示 XML 无该 counter 类型。</li>
  * </ul>
@@ -71,17 +73,24 @@ public final class JacocoReportParser {
         }
 
         // 2. 解析 XML
-        Document doc;
+        //    注意：JaCoCo 生成的 jacoco.xml 包含合法 DOCTYPE 声明
+        //    （<!DOCTYPE report PUBLIC "-//JACOCO//DTD Report 1.1//EN" "report.dtd">），
+        //    因此不能设置 disallow-doctype-decl=true，否则解析直接抛 SAXException。
+        //    通过禁用外部实体、外部 DTD、XInclude 并关闭实体引用来防御 XXE。
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            // XXE 防护
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
             factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
             factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
             factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-            factory.setXIncludeAware(false);
-            factory.setExpandEntityReferences(false);
+        } catch (ParserConfigurationException e) {
+            // 安全特性无法设置时必须显式失败，不能静默降级为不安全配置
+            throw new IllegalStateException("无法配置 JaCoCo XML 解析的 XXE 安全特性", e);
+        }
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
 
+        Document doc;
+        try {
             DocumentBuilder builder = factory.newDocumentBuilder();
             doc = builder.parse(jacocoXml.toFile());
         } catch (Exception e) {
