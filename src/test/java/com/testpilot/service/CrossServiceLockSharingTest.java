@@ -210,12 +210,14 @@ class CrossServiceLockSharingTest {
 
         boolean acquiredOk = acquired.await(5, TimeUnit.SECONDS);
         try {
-            assertTrue(acquiredOk,
-                    "另一个线程应在 5s 内成功获取锁（否则说明锁未被释放）");
-            assertEquals(Boolean.TRUE, result.get(), "另一个线程 tryLock 应返回 true");
+            // 优先检查 checker 线程异常：若其在 acquired.countDown() 之前抛异常，
+            // 应先报告原始异常而非 acquiredOk 超时断言
             if (error.get() != null) {
                 throw new AssertionError("检查线程发生异常", error.get());
             }
+            assertTrue(acquiredOk,
+                    "另一个线程应在 5s 内成功获取锁（否则说明锁未被释放）");
+            assertEquals(Boolean.TRUE, result.get(), "另一个线程 tryLock 应返回 true");
         } finally {
             // 必须确保 checker 线程能退出，无论断言是否失败
             done.countDown();
