@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import org.mockito.MockedStatic;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -13,8 +15,12 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mockStatic;
 
 class TestQualityAnalyzerTest {
 
@@ -146,6 +152,8 @@ class TestQualityAnalyzerTest {
         assertEquals(0, stats.getParseFailedFileCount());
         assertTrue(stats.getClassStats().isEmpty());
         assertTrue(stats.getParseFailedFiles().isEmpty());
+        // 合法的"无测试代码"场景：analysisError 必须为 null，与整体分析失败区分
+        assertNull(stats.getAnalysisError(), "测试目录不存在属于合法空统计，不应标记 analysisError");
     }
 
     // ============ 解析失败不中断 ============
@@ -569,5 +577,74 @@ class TestQualityAnalyzerTest {
 
         assertEquals(2, stats.getTotalTestMethods());
         assertEquals(2, stats.getSkippedTestMethods());
+    }
+
+    // ============ 6.2 加固：单文件统计阶段异常不中断其他文件 ============
+
+    private static final String GOOD_SIMPLE = """
+            package com.example;
+            import org.junit.jupiter.api.Test;
+            import static org.junit.jupiter.api.Assertions.assertEquals;
+            public class GoodTest { @Test void ok() { assertEquals(1, 1); } }
+            """;
+
+    private static final String EXPLOSIVE = """
+            package com.example;
+            import org.junit.jupiter.api.Test;
+            public class ExplosiveTest { @Test void boom() {} }
+            """;
+
+    @Test
+    void analyze_singleFileStatisticsException_recordedAndContinues() throws IOException {
+        // 模拟：某文件在 AST 解析成功后，统计阶段（countAssertions）抛出 RuntimeException
+        Path project = Files.createDirectory(tempDir.resolve("statsex"));
+        writeTestFile(project, "src/test/java/com/example/GoodTest.java", GOOD_SIMPLE);
+        writeTestFile(project, "src/test/java/com/example/ExplosiveTest.java", EXPLOSIVE);
+
+        try (MockedStatic<PromptBuilder> mocked = mockStatic(PromptBuilder.class)) {
+            mocked.when(() -> PromptBuilder.countAssertions(any())).thenAnswer(inv -> {
+                String code = inv.getArgument(0);
+                if (code != null && code.contains("Explosive")) {
+                    throw new RuntimeException("模拟统计阶段异常");
+                }
+                return 1;
+            });
+
+            TestQualityStaticStats stats = TestQualityAnalyzer.analyze(project);
+
+            // 好文件仍被统计（mocked countAssertions 返回 1）
+            assertEquals(1, stats.getTestClassCount(), "单文件异常不应中断其他文件的统计");
+            assertEquals(1, stats.getTotalAssertions());
+            // 异常文件被记录为解析失败
+            assertEquals(1, stats.getParseFailedFileCount());
+            assertTrue(stats.getParseFailedFiles().get(0).contains("ExplosiveTest.java"));
+            // 单文件异常不属于整体分析失败
+            assertNull(stats.getAnalysisError());
+        }
+    }
+
+    // ============ 6.2 加固：整体遍历异常设置 analysisError，不伪装成无测试代码 ============
+
+    @Test
+    void analyze_walkIOException_setsAnalysisError() throws IOException {
+        Path project = Files.createDirectory(tempDir.resolve("walkerr"));
+        writeTestFile(project, "src/test/java/com/example/GoodTest.java", GOOD_SIMPLE);
+
+        // 默认 mockStatic：isSymbolicLink / exists 均返回 false，
+        // 恰好使 TestFileManager.assertPathWithinProject 跳过 toRealPath 校验且不抛异常；
+        // 仅 stub isDirectory 让测试目录被识别为存在，再让 Files.walk 抛出 IOException。
+        try (MockedStatic<Files> mocked = mockStatic(Files.class)) {
+            mocked.when(() -> Files.isDirectory(any(Path.class), any(LinkOption[].class)))
+                    .thenReturn(true);
+            mocked.when(() -> Files.walk(any(Path.class)))
+                    .thenThrow(new IOException("模拟遍历失败"));
+
+            TestQualityStaticStats stats = TestQualityAnalyzer.analyze(project);
+
+            // 整体遍历失败必须标记 analysisError，绝不能静默返回无错误标记的全零统计
+            assertNotNull(stats.getAnalysisError(), "遍历失败应设置 analysisError");
+            assertTrue(stats.getAnalysisError().contains("遍历"),
+                    "analysisError 应体现遍历失败语义");
+        }
     }
 }

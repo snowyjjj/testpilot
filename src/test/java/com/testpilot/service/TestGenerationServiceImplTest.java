@@ -9,6 +9,7 @@ import com.testpilot.dto.TestGenerationRequest;
 import com.testpilot.dto.TestGenerationResponse;
 import com.testpilot.service.impl.TestGenerationServiceImpl;
 import com.testpilot.utils.JUnitDetector;
+import com.testpilot.utils.ProjectExecutionLock;
 import com.testpilot.utils.PromptBuilder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -31,6 +35,7 @@ class TestGenerationServiceImplTest {
     private TestGenerationServiceImpl testGenerationService;
     private ProjectService projectService;
     private LLMService llmService;
+    private ProjectExecutionLock projectExecutionLock;
 
     @TempDir
     Path tempDir;
@@ -39,7 +44,8 @@ class TestGenerationServiceImplTest {
     void setUp() throws IOException {
         projectService = mock(ProjectService.class);
         llmService = mock(LLMService.class);
-        testGenerationService = new TestGenerationServiceImpl(projectService, llmService);
+        projectExecutionLock = new ProjectExecutionLock();
+        testGenerationService = new TestGenerationServiceImpl(projectService, llmService, projectExecutionLock);
         // 默认写入 JUnit 4 的 pom.xml
         writePom(tempDir, JUNIT4_DEP);
     }
@@ -399,5 +405,103 @@ class TestGenerationServiceImplTest {
         String err = PromptBuilder.validateGeneratedCode(code, "com.example", JUnitVersion.JUNIT5);
         assertNotNull(err);
         assertTrue(err.contains("jupiter"));
+    }
+
+    // ============ 6.2 修复：测试生成写入受 ProjectExecutionLock 保护 ============
+
+    /** 由另一个线程验证锁已释放（ReentrantLock 同线程重入会掩盖检查，必须用独立线程）。 */
+    private void assertLockFreeFromAnotherThread(String projectId) throws Exception {
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<Boolean> acquired = new AtomicReference<>(false);
+        AtomicReference<Throwable> err = new AtomicReference<>();
+        Thread checker = new Thread(() -> {
+            try {
+                boolean ok = projectExecutionLock.tryLock(projectId);
+                acquired.set(ok);
+                if (ok) {
+                    projectExecutionLock.unlock(projectId);
+                }
+            } catch (Throwable e) {
+                err.set(e);
+            } finally {
+                done.countDown();
+            }
+        });
+        checker.start();
+        assertTrue(done.await(5, TimeUnit.SECONDS), "checker 线程应在 5s 内完成");
+        assertNull(err.get(), "checker 线程不应抛出异常");
+        assertTrue(acquired.get(), "锁应已释放，另一线程应能成功获取");
+    }
+
+    private void stubNormalGeneration() {
+        MethodContext ctx = buildContext("src/main/java/com/example/Calculator.java");
+        when(projectService.getMethodContext(anyString(), anyString(), anyString(), any()))
+                .thenReturn(ctx);
+        when(projectService.getProjectDir(anyString())).thenReturn(tempDir);
+        when(llmService.chat(anyString())).thenReturn("```java\npackage com.example;\n"
+                + "import org.junit.Test;\npublic class CalculatorTest { @Test public void t(){} }\n```");
+    }
+
+    @Test
+    void generateTest_success_releasesLockAfterWrite() throws Exception {
+        stubNormalGeneration();
+
+        TestGenerationResponse resp = testGenerationService.generateTest("pid-lock", buildRequest());
+
+        assertEquals("GENERATED", resp.getStatus());
+        assertTrue(Files.exists(tempDir.resolve("src/test/java/com/example/CalculatorTest.java")));
+        // 写入完成后锁必须释放（由另一线程验证，避免同线程重入掩盖）
+        assertLockFreeFromAnotherThread("pid-lock");
+    }
+
+    @Test
+    void generateTest_lockHeldByOtherThread_returns409() throws Exception {
+        stubNormalGeneration();
+
+        // 由另一线程持有锁，模拟同项目正在执行其他操作
+        CountDownLatch acquired = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Throwable> err = new AtomicReference<>();
+        Thread holder = new Thread(() -> {
+            try {
+                assertTrue(projectExecutionLock.tryLock("pid-lock"));
+                acquired.countDown();
+                release.await(5, TimeUnit.SECONDS);
+            } catch (Throwable e) {
+                err.set(e);
+            } finally {
+                projectExecutionLock.unlock("pid-lock");
+            }
+        });
+        holder.start();
+        assertTrue(acquired.await(5, TimeUnit.SECONDS), "持有线程应先获取到锁");
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> testGenerationService.generateTest("pid-lock", buildRequest()));
+        assertEquals(409, ex.getCode());
+
+        // 锁被拦截时不应写入任何文件
+        assertFalse(Files.exists(tempDir.resolve("src/test/java/com/example/CalculatorTest.java")));
+
+        release.countDown();
+        holder.join(5000);
+        assertNull(err.get(), "持有线程不应抛出异常");
+    }
+
+    @Test
+    void generateTest_writeException_releasesLock() throws Exception {
+        stubNormalGeneration();
+        // 构造：目标父路径 com/example 预先存在为普通文件，使 saveTestFile 的 createDirectories 抛出，
+        // 触发写入异常路径，验证 finally 中锁仍被释放。
+        Files.createDirectories(tempDir.resolve("src/test/java/com"));
+        Files.writeString(tempDir.resolve("src/test/java/com/example"), "not a dir");
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> testGenerationService.generateTest("pid-lock", buildRequest()));
+        // saveTestFile 将 IOException 转为 500 业务错误
+        assertEquals(500, ex.getCode());
+
+        // 异常情况下锁不能遗留
+        assertLockFreeFromAnotherThread("pid-lock");
     }
 }

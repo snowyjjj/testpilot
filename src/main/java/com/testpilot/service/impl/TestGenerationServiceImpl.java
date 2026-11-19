@@ -9,6 +9,7 @@ import com.testpilot.service.LLMService;
 import com.testpilot.service.ProjectService;
 import com.testpilot.service.TestGenerationService;
 import com.testpilot.utils.JUnitDetector;
+import com.testpilot.utils.ProjectExecutionLock;
 import com.testpilot.utils.PromptBuilder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -26,6 +27,7 @@ public class TestGenerationServiceImpl implements TestGenerationService {
 
     private final ProjectService projectService;
     private final LLMService llmService;
+    private final ProjectExecutionLock projectExecutionLock;
 
     @Override
     public TestGenerationResponse generateTest(String projectId, TestGenerationRequest request) {
@@ -59,18 +61,28 @@ public class TestGenerationServiceImpl implements TestGenerationService {
             throw new BusinessException(500, "生成的测试代码校验失败: " + validationError);
         }
 
-        // 7. 计算测试文件保存路径
+        // 7. 计算测试文件保存路径（纯计算，不持锁）
         Path testFilePath = PromptBuilder.resolveTestFilePath(projectDir, ctx);
 
-        // 8. 保存（原子写入）
-        String relativeTestPath = saveTestFile(projectDir, testFilePath, code);
-
-        return new TestGenerationResponse(relativeTestPath, code, "GENERATED");
+        // 8. 写入前获取项目锁：与测试执行、覆盖率、测试优化、质量评估互斥，
+        //    避免并发修改 src/test/java。锁不包裹上方耗时的 LLM 调用，仅保护真正的文件写入。
+        if (!projectExecutionLock.tryLock(projectId)) {
+            throw new BusinessException(409, "该项目正在执行其他操作，请稍后重试");
+        }
+        try {
+            String relativeTestPath = saveTestFile(projectDir, testFilePath, code);
+            return new TestGenerationResponse(relativeTestPath, code, "GENERATED");
+        } finally {
+            projectExecutionLock.unlock(projectId);
+        }
     }
 
     /**
      * 原子写入测试文件：先写临时文件，再 move 到目标位置。
      * 目标文件已存在时拒绝覆盖。
+     * <p>
+     * <b>调用约束</b>：必须在已获取 {@link ProjectExecutionLock}（同一 projectId）的前提下调用，
+     * 所有写入路径都经过锁保护，不存在绕过锁的入口。
      */
     private String saveTestFile(Path projectDir, Path testFilePath, String code) {
         if (Files.exists(testFilePath)) {

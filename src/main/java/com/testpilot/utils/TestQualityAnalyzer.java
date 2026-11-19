@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -41,7 +42,9 @@ import java.util.stream.Stream;
  *   <li>文件级断言总数复用 {@link PromptBuilder#countAssertions(String)}。</li>
  *   <li>路径安全：遍历前校验 testRoot 整条路径链，逐文件读取前再次校验，
  *       与 {@link TestFileManager#assertPathWithinProject} 保持一致。</li>
- *   <li>单个文件解析失败只记录该文件，不中断整个项目的分析。</li>
+ *   <li>单个文件解析失败或统计异常只记录该文件到 {@code parseFailedFiles}，不中断整个项目的分析。</li>
+ *   <li>整体遍历/分析异常通过 {@code analysisError} 标记并保留已统计的部分数据，
+ *       绝不伪装成"项目没有测试代码"。</li>
  * </ul>
  */
 public final class TestQualityAnalyzer {
@@ -53,9 +56,17 @@ public final class TestQualityAnalyzer {
 
     /**
      * 分析指定 Maven 项目根目录下的测试代码静态质量。
+     * <p>
+     * 异常与状态语义：
+     * <ul>
+     *   <li>{@code src/test/java} 不存在：返回合法全零统计，{@code analysisError} 为 null。</li>
+     *   <li>单个文件解析失败或统计异常：记录到 {@code parseFailedFiles}，继续分析其他文件。</li>
+     *   <li>整体遍历/分析异常：设置 {@code analysisError}，保留已统计到的部分数据，
+     *       绝不伪装成"没有测试代码"。</li>
+     * </ul>
      *
      * @param mavenProjectDir Maven 项目根目录（包含 src/test/java 的目录）
-     * @return 聚合后的静态统计结果；若 {@code src/test/java} 不存在或路径不安全则返回全零统计
+     * @return 聚合后的静态统计结果
      */
     public static TestQualityStaticStats analyze(Path mavenProjectDir) {
         if (mavenProjectDir == null) {
@@ -67,6 +78,7 @@ public final class TestQualityAnalyzer {
         Path testRoot = mavenProjectDir.resolve("src").resolve("test").resolve("java");
         // NOFOLLOW_LINKS：若 testRoot 最后一级自身是符号链接，则不视为有效目录
         if (!Files.isDirectory(testRoot, LinkOption.NOFOLLOW_LINKS)) {
+            // 合法的"无测试代码"场景：analysisError 保持 null
             log.debug("测试源码目录不存在，跳过静态分析: {}", testRoot);
             return result;
         }
@@ -77,10 +89,14 @@ public final class TestQualityAnalyzer {
         try {
             TestFileManager.assertPathWithinProject(mavenProjectDir, testRoot);
         } catch (IOException e) {
+            // 路径不安全属于错误，不能伪装成"没有测试代码"，设置 analysisError 标记
             log.warn("测试源码目录路径不安全（含符号链接或越界），跳过分析: {}", testRoot, e);
+            result.setAnalysisError("测试源码目录路径校验失败，已跳过静态分析");
             return result;
         }
 
+        // Files.walk 的异常可能发生在 Stream 创建阶段，也可能发生在终端操作（.toList()）实际遍历阶段。
+        // UncheckedIOException 由 Stream 内部包装的 IOException 抛出，需一并捕获。
         try (Stream<Path> stream = Files.walk(testRoot)) {
             List<Path> javaFiles = stream
                     .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
@@ -88,16 +104,39 @@ public final class TestQualityAnalyzer {
                     .toList();
 
             for (Path javaFile : javaFiles) {
-                analyzeFile(mavenProjectDir, javaFile, result);
+                analyzeFileSafely(mavenProjectDir, javaFile, result);
             }
-        } catch (IOException e) {
-            // 遍历失败时记录日志，已统计的结果保留
+        } catch (IOException | UncheckedIOException e) {
+            // 整体遍历失败：设置 analysisError，保留已统计到的部分数据
             log.warn("遍历测试源码目录失败: {}", testRoot, e);
+            result.setAnalysisError("遍历测试源码目录失败，已保留部分统计结果");
+        } catch (RuntimeException e) {
+            // 整体分析的其他意外运行时异常：同样标记错误并保留部分数据，不向上抛出中断评估流程
+            log.error("静态分析发生意外异常: {}", testRoot, e);
+            result.setAnalysisError("静态分析发生意外异常，已保留部分统计结果");
         }
 
         // 解析失败文件数与列表保持一致
         result.setParseFailedFileCount(result.getParseFailedFiles().size());
         return result;
+    }
+
+    /**
+     * 单文件分析的安全包装：任何意外异常（包括 AST 解析成功后统计逻辑抛出的 RuntimeException）
+     * 都只记录该文件到 {@code parseFailedFiles}，不中断整体分析。
+     */
+    private static void analyzeFileSafely(Path mavenProjectDir, Path javaFile, TestQualityStaticStats result) {
+        try {
+            analyzeFile(mavenProjectDir, javaFile, result);
+        } catch (Exception e) {
+            String relativePath = toRelativePath(mavenProjectDir, javaFile);
+            log.warn("分析测试文件时发生异常，跳过: {}", javaFile, e);
+            // 避免 analyzeFile 内部已记录后又抛出导致重复
+            List<String> failed = result.getParseFailedFiles();
+            if (!failed.contains(relativePath)) {
+                failed.add(relativePath);
+            }
+        }
     }
 
     private static void analyzeFile(Path mavenProjectDir, Path javaFile, TestQualityStaticStats result) {

@@ -47,4 +47,15 @@ public class TestQualityStaticStats implements Serializable {
 
     /** 每个测试类的统计明细 */
     private List<TestClassStat> classStats = new ArrayList<>();
+
+    /**
+     * 整体分析错误信息。
+     * <ul>
+     *   <li>{@code null}：分析正常完成（或 src/test/java 合法地不存在，属于"无测试代码"）。</li>
+     *   <li>非 {@code null}：遍历目录或整体分析发生异常，已保留部分统计结果。
+     *       不应被伪装成"项目没有测试代码"。</li>
+     * </ul>
+     * 仅保存脱敏后的简短描述，详细异常与本机绝对路径仅记录到日志。
+     */
+    private String analysisError;
 }
