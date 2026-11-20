@@ -26,6 +26,8 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PushbackInputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -35,6 +37,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
@@ -58,6 +62,10 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Value("${testpilot.storage.extracted-path:storage/extracted}")
     private String extractedStoragePath;
+
+    // 按 projectId 隔离的解压锁：仅保护首次解压临界区，使用阻塞 lock() 让并发败者等待胜者完成，
+    // 而不是返回 409，从而保持现有 API 行为。锁对象常驻不移除，避免同一 projectId 出现两个锁实例。
+    private final ConcurrentHashMap<String, ReentrantLock> extractionLocks = new ConcurrentHashMap<>();
 
     @Override
     public ProjectUploadResponse uploadProject(MultipartFile file) {
@@ -305,7 +313,14 @@ public class ProjectServiceImpl implements ProjectService {
 
     /**
      * 确保项目已解压。若解压目录已存在则直接复用，不再重新解压。
-     * 解压失败时清理本次产生的不完整目录，保留原始 ZIP。
+     *
+     * 并发安全：同一 projectId 的首次解压通过按 projectId 隔离的阻塞锁串行化，
+     * 并发败者阻塞等待胜者完成后经双重检查直接返回完整目录，不会读到不完整目录，
+     * 也不会因 tryLock 失败而返回 409（保持现有 API 行为）。
+     *
+     * 原子性：先解压到正式目录同级的唯一临时目录，全部成功后再以 ATOMIC_MOVE 原子移交。
+     * 任何失败都只清理临时目录，绝不触碰正式目录——因此正式目录要么不存在、要么完整，
+     * 失败后可安全重试；同时不会删除已存在目录中的用户生成测试文件。
      */
     private Path ensureExtracted(String projectId) {
         Path zipFile = Paths.get(projectStoragePath).toAbsolutePath().normalize()
@@ -316,24 +331,63 @@ public class ProjectServiceImpl implements ProjectService {
 
         Path projectDir = Paths.get(extractedStoragePath).toAbsolutePath().normalize()
                 .resolve(projectId);
+
+        // 无锁快速判断：已存在的目录（含历史遗留目录）直接复用，不覆盖其中的用户测试文件
         if (Files.exists(projectDir)) {
             return projectDir;
         }
 
+        ReentrantLock lock = extractionLocks.computeIfAbsent(projectId, k -> new ReentrantLock());
+        lock.lock();
         try {
-            Files.createDirectories(projectDir);
-            extractZip(zipFile, projectDir);
-        } catch (IOException e) {
-            log.error("项目解压失败, projectId={}", projectId, e);
-            // 清理本次产生的不完整目录，保留原始 ZIP
-            try {
-                deleteDirectory(projectDir);
-            } catch (IOException cleanupEx) {
-                log.warn("清理不完整解压目录失败, projectId={}", projectId, cleanupEx);
+            // 双重检查：等待期间可能已由其他线程解压完成
+            if (Files.exists(projectDir)) {
+                return projectDir;
             }
-            throw new BusinessException(500, "项目解压失败");
+
+            // 临时目录与正式目录同属 extractedStoragePath，保证同一文件系统，ATOMIC_MOVE 可用
+            Path tempDir = projectDir.getParent()
+                    .resolve(projectId + ".extract-" + UUID.randomUUID());
+            try {
+                Files.createDirectories(tempDir);
+                extractZip(zipFile, tempDir);
+
+                // 目标目录意外存在：按"不删除已有目录/用户文件"约束，视为已完成，仅清理临时目录
+                if (Files.exists(projectDir)) {
+                    log.warn("解压移交时目标目录已存在, projectId={}, 复用已有目录", projectId);
+                    cleanupQuietly(tempDir, projectId);
+                    return projectDir;
+                }
+
+                try {
+                    Files.move(tempDir, projectDir, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException e) {
+                    // 不静默降级：明确失败并清理临时目录，不声称原子性得到保证
+                    log.error("原子移动不受支持, 无法保证解压原子性, projectId={}", projectId, e);
+                    throw new IOException("原子移动不受支持，无法保证解压原子性: " + projectDir, e);
+                } catch (FileAlreadyExistsException e) {
+                    // 与 exists 判断之间的竞态：复用已有目录，清理临时目录
+                    log.warn("解压移交时目标目录已存在(FileAlreadyExists), projectId={}", projectId);
+                    cleanupQuietly(tempDir, projectId);
+                }
+                return projectDir;
+            } catch (IOException e) {
+                log.error("项目解压失败, projectId={}", projectId, e);
+                // 仅清理临时目录，绝不触碰正式目录（可能已存在且含用户文件）
+                cleanupQuietly(tempDir, projectId);
+                throw new BusinessException(500, "项目解压失败");
+            }
+        } finally {
+            lock.unlock();
         }
-        return projectDir;
+    }
+
+    private void cleanupQuietly(Path dir, String projectId) {
+        try {
+            deleteDirectory(dir);
+        } catch (IOException e) {
+            log.warn("清理解压临时目录失败, projectId={}, dir={}", projectId, dir, e);
+        }
     }
 
     /**

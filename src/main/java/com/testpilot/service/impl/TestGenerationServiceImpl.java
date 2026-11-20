@@ -11,6 +11,7 @@ import com.testpilot.service.TestGenerationService;
 import com.testpilot.utils.JUnitDetector;
 import com.testpilot.utils.ProjectExecutionLock;
 import com.testpilot.utils.PromptBuilder;
+import com.testpilot.utils.TestFileManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -85,15 +86,21 @@ public class TestGenerationServiceImpl implements TestGenerationService {
      * 所有写入路径都经过锁保护，不存在绕过锁的入口。
      */
     private String saveTestFile(Path projectDir, Path testFilePath, String code) {
-        if (Files.exists(testFilePath)) {
-            throw new BusinessException(409, "测试文件已存在，拒绝覆盖: "
-                    + projectDir.relativize(testFilePath).toString().replace("\\", "/"));
-        }
-
         try {
+            // 写入前边界校验：复用 TestFileManager 的权威路径校验（双端归一化 + 符号链接链检测
+            // + 真实路径二次确认），防止测试文件被写到项目目录之外。
+            // resolveTestFilePath 已做 normalize 前缀快速校验，此处为写入边界的纵深防御，
+            // 专门覆盖符号链接逃逸与校验后被替换（TOCTOU）的场景。
+            TestFileManager.assertPathWithinProject(projectDir, testFilePath);
+
+            if (Files.exists(testFilePath)) {
+                throw new BusinessException(409, "测试文件已存在，拒绝覆盖: "
+                        + projectDir.relativize(testFilePath).toString().replace("\\", "/"));
+            }
+
             Files.createDirectories(testFilePath.getParent());
 
-            // 临时文件写入
+            // 临时文件在已通过边界校验的父目录下创建，不会落到项目目录之外
             Path tempFile = Files.createTempFile(testFilePath.getParent(), ".test-", ".tmp");
             try {
                 Files.writeString(tempFile, code);
@@ -105,6 +112,9 @@ public class TestGenerationServiceImpl implements TestGenerationService {
                     Files.deleteIfExists(tempFile);
                 }
             }
+
+            // 移动后再次校验：防止校验与移动之间目标路径被替换为符号链接（TOCTOU）
+            TestFileManager.assertPathWithinProject(projectDir, testFilePath);
         } catch (IOException e) {
             log.error("保存测试文件失败: {}", testFilePath, e);
             throw new BusinessException(500, "保存测试文件失败");

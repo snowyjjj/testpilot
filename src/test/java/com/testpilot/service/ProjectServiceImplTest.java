@@ -18,6 +18,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -676,5 +683,208 @@ class ProjectServiceImplTest {
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> projectService.getMavenProjectDir("  "));
         assertEquals(400, ex.getCode());
+    }
+
+    // ============ 解压并发安全测试 ============
+
+    @SuppressWarnings("unchecked")
+    private ConcurrentHashMap<String, ReentrantLock> extractionLocks() {
+        return (ConcurrentHashMap<String, ReentrantLock>)
+                ReflectionTestUtils.getField(projectService, "extractionLocks");
+    }
+
+    private Path extractedRoot() {
+        return tempDir.resolve("extracted");
+    }
+
+    private long countExtractTempDirs() throws IOException {
+        Path root = extractedRoot();
+        if (!Files.exists(root)) {
+            return 0;
+        }
+        try (java.util.stream.Stream<Path> stream = Files.list(root)) {
+            return stream.filter(Files::isDirectory)
+                    .map(p -> p.getFileName().toString())
+                    .filter(n -> n.contains(".extract-"))
+                    .count();
+        }
+    }
+
+    /** 构造条目较多的 ZIP：放大首次解压的竞态窗口，pom.xml 放在前面保证根目录可定位。 */
+    private byte[] createManyEntriesZip(int fileCount) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+            for (int i = 0; i < fileCount; i++) {
+                zos.putNextEntry(new ZipEntry("src/main/resources/data_" + i + ".txt"));
+                zos.write(("content-" + i).getBytes());
+                zos.closeEntry();
+            }
+            zos.putNextEntry(new ZipEntry("src/main/java/com/example/App.java"));
+            zos.write("package com.example;\npublic class App {}".getBytes());
+            zos.closeEntry();
+        }
+        return baos.toByteArray();
+    }
+
+    private byte[] createTraversalZip() throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("pom.xml"));
+            zos.write("<project/>".getBytes());
+            zos.closeEntry();
+            zos.putNextEntry(new ZipEntry("../../evil.txt"));
+            zos.write("hacked!".getBytes());
+            zos.closeEntry();
+        }
+        return baos.toByteArray();
+    }
+
+    /** 用 CountDownLatch 同时释放 N 个线程执行 action，返回首个捕获到的异常。 */
+    private Throwable runConcurrent(int threadCount, java.util.function.Consumer<Integer> action)
+            throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(threadCount);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < threadCount; i++) {
+            final int idx = i;
+            Thread t = new Thread(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    action.accept(idx);
+                } catch (Throwable e) {
+                    error.compareAndSet(null, e);
+                }
+            }, "worker-" + i);
+            threads.add(t);
+            t.start();
+        }
+        assertTrue(ready.await(5, TimeUnit.SECONDS), "线程未能在超时内就绪");
+        start.countDown();
+        for (Thread t : threads) {
+            t.join(15_000);
+            assertFalse(t.isAlive(), "线程未在超时内结束: " + t.getName());
+        }
+        return error.get();
+    }
+
+    @Test
+    void ensureExtracted_concurrentFirstAccess_allSucceed() throws Exception {
+        String projectId = uploadAndGetId(createManyEntriesZip(100), "concurrent.zip");
+        Throwable error = runConcurrent(8, idx -> {
+            ProjectParseResponse resp = projectService.parseProject(projectId);
+            if (resp.getFiles().isEmpty()) {
+                throw new AssertionError("解析到空文件集，可能读取到不完整目录");
+            }
+        });
+        assertNull(error, "同一 projectId 多线程首次访问应全部成功: " + error);
+
+        Path projectDir = extractedRoot().resolve(projectId);
+        assertTrue(Files.isRegularFile(projectDir.resolve("pom.xml")));
+        assertTrue(Files.isRegularFile(projectDir.resolve("src/main/java/com/example/App.java")));
+        assertEquals(0, countExtractTempDirs(), "解压完成后不应残留临时目录");
+    }
+
+    @Test
+    void ensureExtracted_concurrentFirstAccess_noIncompleteMavenDir() throws Exception {
+        // 多个读线程并发首次访问：若读到不完整目录会因找不到 pom.xml 抛 404
+        String projectId = uploadAndGetId(createManyEntriesZip(200), "race.zip");
+        Throwable error = runConcurrent(12, idx -> {
+            Path mavenDir = projectService.getMavenProjectDir(projectId);
+            if (!Files.isRegularFile(mavenDir.resolve("pom.xml"))) {
+                throw new AssertionError("读到不完整目录，缺少 pom.xml");
+            }
+        });
+        assertNull(error, "并发首次访问期间不应读到不完整目录: " + error);
+        assertEquals(0, countExtractTempDirs());
+    }
+
+    @Test
+    void ensureExtracted_failure_noProjectDirAndNoTempDirLeft() throws IOException {
+        // 路径穿越 ZIP：上传校验不查穿越，但解压阶段会拒绝，触发真实解压失败
+        String projectId = uploadAndGetId(createTraversalZip(), "traversal-fail.zip");
+
+        BusinessException ex = assertThrows(BusinessException.class,
+                () -> projectService.parseProject(projectId));
+        assertEquals(500, ex.getCode());
+
+        // 失败后正式目录不应存在，否则会被误认为已解压完成
+        assertFalse(Files.exists(extractedRoot().resolve(projectId)),
+                "解压失败后不应留下正式目录");
+        // 临时目录必须清理干净
+        assertEquals(0, countExtractTempDirs(), "解压失败后不应残留临时目录");
+    }
+
+    @Test
+    void ensureExtracted_failureThenRetry_succeeds() throws IOException {
+        String projectId = uploadAndGetId(createTraversalZip(), "retry-bad.zip");
+
+        // 首次解压失败，且不留下正式目录
+        assertThrows(BusinessException.class, () -> projectService.parseProject(projectId));
+        assertFalse(Files.exists(extractedRoot().resolve(projectId)));
+        assertEquals(0, countExtractTempDirs());
+
+        // 用同一 projectId 覆盖为合法 ZIP，验证失败后可安全重试
+        Path zipFile = tempDir.resolve(projectId + ".zip");
+        byte[] goodZip = createZipWithContents(java.util.Map.of(
+                "pom.xml", "<project/>",
+                "src/main/java/com/example/App.java",
+                "package com.example;\npublic class App {}"));
+        Files.write(zipFile, goodZip);
+
+        ProjectParseResponse resp = projectService.parseProject(projectId);
+        assertFalse(resp.getFiles().isEmpty());
+        Path projectDir = extractedRoot().resolve(projectId);
+        assertTrue(Files.isRegularFile(projectDir.resolve("pom.xml")));
+        assertEquals(0, countExtractTempDirs());
+    }
+
+    @Test
+    void ensureExtracted_existingDirReused_noReExtractionAndTestFilePreserved() throws IOException {
+        String projectId = uploadAndGetId(createZipWithContents(
+                java.util.Map.of("pom.xml", "<project/>",
+                        "src/main/java/com/example/Calc.java",
+                        "package com.example;\npublic class Calc {}")), "reuse2.zip");
+        projectService.parseProject(projectId);
+
+        Path projectDir = extractedRoot().resolve(projectId);
+        Path testFile = projectDir.resolve("src/test/java/com/example/CalcTest.java");
+        Files.createDirectories(testFile.getParent());
+        Files.writeString(testFile, "package com.example;\nclass CalcTest {}");
+
+        // 二次访问：快速路径直接复用，不创建临时目录，不删除/覆盖测试文件
+        projectService.parseProject(projectId);
+        projectService.getMavenProjectDir(projectId);
+
+        assertTrue(Files.exists(testFile), "已生成的测试文件不应被重新解压覆盖");
+        assertEquals(0, countExtractTempDirs(), "复用已有目录时不应创建解压临时目录");
+    }
+
+    @Test
+    void ensureExtracted_differentProjectIds_useDistinctLocksAndExtractInParallel() throws Exception {
+        String idA = uploadAndGetId(createZipWithContents(
+                java.util.Map.of("pom.xml", "<project/>",
+                        "src/main/java/A.java", "class A {}")), "a.zip");
+        String idB = uploadAndGetId(createZipWithContents(
+                java.util.Map.of("pom.xml", "<project/>",
+                        "src/main/java/B.java", "class B {}")), "b.zip");
+
+        Throwable error = runConcurrent(2, idx -> {
+            String pid = (idx == 0) ? idA : idB;
+            projectService.parseProject(pid);
+        });
+        assertNull(error, "不同 projectId 应能独立解压成功: " + error);
+
+        // 结构验证：两个 projectId 映射到不同的锁实例，证明不是同一把全局锁
+        ConcurrentHashMap<String, ReentrantLock> map = extractionLocks();
+        ReentrantLock lockA = map.get(idA);
+        ReentrantLock lockB = map.get(idB);
+        assertNotNull(lockA);
+        assertNotNull(lockB);
+        assertNotSame(lockA, lockB, "不同 projectId 应使用各自独立的锁实例");
     }
 }

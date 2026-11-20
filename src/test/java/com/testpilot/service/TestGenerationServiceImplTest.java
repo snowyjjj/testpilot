@@ -11,6 +11,7 @@ import com.testpilot.service.impl.TestGenerationServiceImpl;
 import com.testpilot.utils.JUnitDetector;
 import com.testpilot.utils.ProjectExecutionLock;
 import com.testpilot.utils.PromptBuilder;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -503,5 +504,105 @@ class TestGenerationServiceImplTest {
 
         // 异常情况下锁不能遗留
         assertLockFreeFromAnotherThread("pid-lock");
+    }
+
+    // ============ P1 修复：测试生成写入前路径边界校验 ============
+
+    /** 统计 projectDir 下匹配指定前缀、以 .tmp 结尾的普通文件数量，用于验证无临时文件残留。 */
+    private long countTempFiles(Path dir, String prefix) throws IOException {
+        if (!Files.exists(dir)) {
+            return 0;
+        }
+        try (java.util.stream.Stream<Path> walk = Files.walk(dir)) {
+            return walk.filter(Files::isRegularFile)
+                    .map(p -> p.getFileName().toString())
+                    .filter(n -> n.startsWith(prefix) && n.endsWith(".tmp"))
+                    .count();
+        }
+    }
+
+    @Test
+    void generateTest_success_noTempFileLeak() throws Exception {
+        stubNormalGeneration();
+
+        TestGenerationResponse resp = testGenerationService.generateTest("pid-p1", buildRequest());
+
+        assertEquals("GENERATED", resp.getStatus());
+        Path target = tempDir.resolve("src/test/java/com/example/CalculatorTest.java");
+        assertTrue(Files.exists(target), "测试文件应正常写入项目目录内");
+        // 成功写入后不应残留任何 .test-*.tmp 临时文件；临时文件只在已校验的父目录下创建
+        assertEquals(0, countTempFiles(tempDir, ".test-"), "不应残留临时文件");
+    }
+
+    @Test
+    void generateTest_pathOutsideProject_rejected() {
+        // sourceFilePath 含足够多的 .. 使归一化后的路径越出项目目录
+        MethodContext ctx = buildContext("src/main/java/../../../../Evil.java");
+        when(projectService.getMethodContext(anyString(), anyString(), anyString(), any()))
+                .thenReturn(ctx);
+        when(projectService.getProjectDir(anyString())).thenReturn(tempDir);
+
+        RuntimeException ex = assertThrows(RuntimeException.class,
+                () -> testGenerationService.generateTest("pid-p1", buildRequest()));
+        assertNotNull(ex.getMessage());
+
+        // 项目目录之外不得产生任何文件
+        Path escaped = tempDir.getParent().resolve("Evil.java");
+        assertFalse(Files.exists(escaped), "越界路径不得写入项目目录之外");
+    }
+
+    @Test
+    void generateTest_dotDotTraversal_rejected() {
+        // sourceFilePath 以 .. 开头，直接从项目根向上穿越
+        MethodContext ctx = buildContext("../../Evil.java");
+        when(projectService.getMethodContext(anyString(), anyString(), anyString(), any()))
+                .thenReturn(ctx);
+        when(projectService.getProjectDir(anyString())).thenReturn(tempDir);
+
+        assertThrows(RuntimeException.class,
+                () -> testGenerationService.generateTest("pid-p1", buildRequest()));
+
+        Path escaped = tempDir.resolve("../../Evil.java").normalize();
+        assertFalse(Files.exists(escaped), "含 .. 的穿越路径不得写入");
+    }
+
+    @Test
+    void generateTest_symlinkEscape_rejected() throws Exception {
+        // 在项目目录内创建一个指向项目外目录的符号链接目录。
+        // resolveTestFilePath 的字符串前缀校验会通过（链接名位于项目内），
+        // 但 saveTestFile 调用的 assertPathWithinProject 会逐级检测符号链接链并拒绝写入，
+        // 从而验证写入边界的纵深防御真正生效。
+        Path realOutsideDir = tempDir.resolve("outside");
+        Files.createDirectories(realOutsideDir);
+
+        Path symlinkDir = tempDir.resolve("evil");
+        boolean symlinkSupported;
+        try {
+            Files.createSymbolicLink(symlinkDir, realOutsideDir);
+            symlinkSupported = Files.isSymbolicLink(symlinkDir);
+        } catch (IOException | UnsupportedOperationException e) {
+            symlinkSupported = false;
+        }
+        // Windows 通常需要管理员权限或开发者模式才能创建符号链接；无法可靠创建时跳过，不伪造通过
+        Assumptions.assumeTrue(symlinkSupported,
+                "当前环境无法可靠创建/检测符号链接，跳过符号链接逃逸测试");
+
+        // sourceFilePath 不含 src/main/java → 走 else 分支，testRelative = "evil/CalculatorTest.java"
+        MethodContext ctx = buildContext("evil/Calculator.java");
+        when(projectService.getMethodContext(anyString(), anyString(), anyString(), any()))
+                .thenReturn(ctx);
+        when(projectService.getProjectDir(anyString())).thenReturn(tempDir);
+        when(llmService.chat(anyString())).thenReturn("```java\npackage com.example;\n"
+                + "import org.junit.Test;\npublic class CalculatorTest { @Test public void t(){} }\n```");
+
+        Exception ex = assertThrows(Exception.class,
+                () -> testGenerationService.generateTest("pid-p1", buildRequest()));
+        assertNotNull(ex.getMessage());
+
+        // 符号链接指向的真实外部目录不得被写入
+        Path escapedFile = realOutsideDir.resolve("CalculatorTest.java");
+        assertFalse(Files.exists(escapedFile), "符号链接逃逸不得写入项目目录之外");
+        // 也不得残留临时文件
+        assertEquals(0, countTempFiles(tempDir, ".test-"), "被拒绝后不应残留临时文件");
     }
 }
