@@ -7,7 +7,8 @@ import lombok.NoArgsConstructor;
 import java.io.Serializable;
 
 /**
- * 单元测试质量评估整合结果（6.2）。
+ * 单元测试质量评估整合结果。
+ * 6.3 新增 qualityReport 字段，向后兼容：原有 3 参构造器保留（qualityReport 默认 null）。
  * <p>
  * 将一次评估中的两部分数据组合返回：
  * <ul>
@@ -32,4 +33,19 @@ public class TestQualityResult implements Serializable {
 
     /** 覆盖率执行结果（含原始测试执行结果） */
     private CoverageResult coverageResult;
+
+    /**
+     * 测试质量评分报告（6.3）。
+     * 由 {@link com.testpilot.utils.QualityScorer} 基于 staticStats + coverageResult 纯函数计算得出。
+     * null 表示 6.3 评分未执行（向后兼容，老版本客户端忽略此字段）。
+     */
+    private QualityReport qualityReport;
+
+    /** 6.2 向后兼容的 3 参构造器：qualityReport 默认 null。 */
+    public TestQualityResult(String projectId, TestQualityStaticStats staticStats, CoverageResult coverageResult) {
+        this.projectId = projectId;
+        this.staticStats = staticStats;
+        this.coverageResult = coverageResult;
+        this.qualityReport = null;
+    }
 }

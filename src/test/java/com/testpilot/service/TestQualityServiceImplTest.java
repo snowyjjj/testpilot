@@ -10,6 +10,7 @@ import com.testpilot.dto.TestExecutionResult;
 import com.testpilot.dto.TestGenerationRequest;
 import com.testpilot.dto.TestQualityResult;
 import com.testpilot.dto.TestQualityStaticStats;
+import com.testpilot.dto.QualityReport;
 import com.testpilot.service.impl.TestGenerationServiceImpl;
 import com.testpilot.service.impl.TestQualityServiceImpl;
 import com.testpilot.utils.ProjectExecutionLock;
@@ -26,6 +27,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -377,5 +379,128 @@ class TestQualityServiceImplTest {
         req.setMethodName("add");
         req.setParamTypes(List.of("int", "int"));
         return req;
+    }
+
+    // ============ 6.3 qualityReport 集成验证 ============
+
+    @Test
+    void evaluate_normal_returnsQualityReport() throws IOException {
+        Path projectDir = Files.createDirectory(tempDir.resolve("normal"));
+        when(projectService.getMavenProjectDir("p1")).thenReturn(projectDir);
+
+        // 准备 src/test/java 空目录（TestQualityAnalyzer 返回默认全零 stats）
+        Path testJava = projectDir.resolve("src").resolve("test").resolve("java");
+        Files.createDirectories(testJava);
+
+        TestExecutionResult exec = new TestExecutionResult("p1", true, "PASSED", 0,
+                11, 11, 0, 0, 0L, null, null);
+        CoverageResult cov = new CoverageResult("p1", exec, "COVERAGE_GENERATED",
+                List.of(
+                        new CoverageMetric("LINE", true, 20, 80, 80.0),
+                        new CoverageMetric("BRANCH", true, 30, 70, 70.0),
+                        new CoverageMetric("METHOD", true, 15, 85, 85.0),
+                        new CoverageMetric("INSTRUCTION", true, 0, 1000, 90.0),
+                        new CoverageMetric("COMPLEXITY", true, 5, 15, null),
+                        new CoverageMetric("CLASS", true, 2, 8, 80.0)
+                ), null);
+        when(coverageService.runCoverage("p1")).thenReturn(cov);
+
+        TestQualityResult result = service.evaluate("p1");
+
+        // 原有字段保持兼容
+        assertEquals("p1", result.getProjectId());
+        assertNotNull(result.getStaticStats());
+        assertNotNull(result.getCoverageResult());
+
+        // 6.3 qualityReport 正常生成
+        QualityReport report = result.getQualityReport();
+        assertNotNull(report, "qualityReport 不应为 null");
+        assertNotNull(report.getOverallScore());
+        assertNotNull(report.getGrade());
+        assertNotNull(report.getDimensions());
+        // 4 个维度
+        assertEquals(4, report.getDimensions().size());
+        assertTrue(report.getIssues() != null);
+    }
+
+    @Test
+    void evaluate_compileError_gradeNA_stillHasIssues() throws IOException {
+        Path projectDir = Files.createDirectory(tempDir.resolve("compile"));
+        when(projectService.getMavenProjectDir("p2")).thenReturn(projectDir);
+
+        TestExecutionResult exec = new TestExecutionResult("p2", false, "COMPILE_ERROR", -1,
+                0, 0, 0, 0, 0L, null, null);
+        CoverageResult cov = new CoverageResult("p2", exec, "NO_COVERAGE", List.of(), null);
+        when(coverageService.runCoverage("p2")).thenReturn(cov);
+
+        TestQualityResult result = service.evaluate("p2");
+        QualityReport report = result.getQualityReport();
+        assertNotNull(report);
+        // 综合分 N/A：运行时维度 0 个
+        assertNull(report.getOverallScore());
+        assertEquals("N/A", report.getGrade());
+
+        // 但 COMPILE_ERROR issue 仍然生成
+        assertTrue(report.getIssues().stream()
+                .anyMatch(i -> "COMPILE_ERROR".equals(i.getCategory())),
+                "COMPILE_ERROR 状态应生成 COMPILE_ERROR 建议");
+    }
+
+    @Test
+    void evaluate_lockConflict_returns409() throws Exception {
+        // 用另一线程先持锁 → Service 在主线程 tryLock 失败 → 409
+        CountDownLatch acquired = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(1);
+        new Thread(() -> {
+            lock.tryLock("p3");
+            acquired.countDown();
+            try { done.await(5, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+            lock.unlock("p3");
+        }, "holder").start();
+        acquired.await(5, TimeUnit.SECONDS);
+
+        try {
+            BusinessException ex = assertThrows(BusinessException.class,
+                    () -> service.evaluate("p3"));
+            assertEquals(409, ex.getCode());
+        } finally {
+            done.countDown();
+        }
+    }
+
+    // ============ 12. 锁内操作异常时，finally 必须释放项目锁 ============
+
+    @Test
+    void evaluate_runCoverageThrows_lockReleasedAfterException() throws Exception {
+        // runCoverage 模拟抛异常：锁内异常 → finally 释放锁 → 评分不执行 → 异常原样抛出
+        when(projectService.getMavenProjectDir("p4")).thenReturn(tempDir);
+        when(coverageService.runCoverage("p4"))
+                .thenThrow(new RuntimeException("模拟执行失败"));
+
+        RuntimeException ex = assertThrows(RuntimeException.class, () -> service.evaluate("p4"));
+        assertEquals("模拟执行失败", ex.getMessage());
+
+        // 用另一线程验证锁已释放（避免 ReentrantLock 同线程可重入导致误判）
+        CountDownLatch acquired = new CountDownLatch(1);
+        AtomicReference<Boolean> acquiredOk = new AtomicReference<>(false);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        Thread checker = new Thread(() -> {
+            try {
+                boolean ok = lock.tryLock("p4");
+                acquiredOk.set(ok);
+                if (ok) {
+                    lock.unlock("p4");
+                }
+            } catch (Throwable t) {
+                error.set(t);
+            } finally {
+                acquired.countDown();
+            }
+        }, "lock-checker");
+        checker.start();
+        assertTrue(acquired.await(5, TimeUnit.SECONDS), "checker 线程应在超时内完成");
+        checker.join(5000);
+        assertNull(error.get(), "checker 线程不应抛出异常");
+        assertTrue(acquiredOk.get(), "锁内异常后项目锁必须已释放，另一线程应能获取");
     }
 }

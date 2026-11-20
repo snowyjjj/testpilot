@@ -8,6 +8,7 @@ import com.testpilot.service.CoverageService;
 import com.testpilot.service.ProjectService;
 import com.testpilot.service.TestQualityService;
 import com.testpilot.utils.ProjectExecutionLock;
+import com.testpilot.utils.QualityScorer;
 import com.testpilot.utils.TestQualityAnalyzer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,6 +30,8 @@ import java.nio.file.Path;
  *   <li>调用 {@link TestQualityAnalyzer#analyze} 在锁保护内完成静态分析，
  *       保证静态统计与执行/覆盖率数据来自同一时刻。</li>
  * </ol>
+ * 评分（{@link QualityScorer#score}）在 finally 释放项目锁之后执行——纯计算、无 I/O，
+ * 既保证执行/覆盖率/静态分析数据来自同一临界区，又避免评分期间无谓持锁。
  * 静态分析的整体异常通过 {@code staticStats.analysisError} 表达，绝不丢弃已取得的
  * {@code coverageResult}；执行或覆盖率异常按既有语义原样抛出（finally 仍会释放锁）。
  */
@@ -51,6 +54,7 @@ public class TestQualityServiceImpl implements TestQualityService {
         if (!projectExecutionLock.tryLock(projectId)) {
             throw new BusinessException(409, "该项目正在执行其他操作，请稍后重试");
         }
+        TestQualityResult result;
         try {
             // D2：先加锁，再定位项目目录
             Path mavenProjectDir = projectService.getMavenProjectDir(projectId);
@@ -61,9 +65,15 @@ public class TestQualityServiceImpl implements TestQualityService {
             // 锁保护内静态分析：异常通过 analysisError 表达，不抛出、不丢弃 coverageResult
             TestQualityStaticStats staticStats = TestQualityAnalyzer.analyze(mavenProjectDir);
 
-            return new TestQualityResult(projectId, staticStats, coverageResult);
+            // 锁内仅组装结果，评分留到锁释放后
+            result = new TestQualityResult(projectId, staticStats, coverageResult);
         } finally {
+            // 无论正常还是异常，finally 都先释放项目锁
             projectExecutionLock.unlock(projectId);
         }
+
+        // 锁释放后再评分：纯计算，无 I/O，不影响并发安全且缩短持锁时间
+        result.setQualityReport(QualityScorer.score(result));
+        return result;
     }
 }
