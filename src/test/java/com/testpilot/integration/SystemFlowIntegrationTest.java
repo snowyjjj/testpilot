@@ -2,12 +2,15 @@ package com.testpilot.integration;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.testpilot.dto.FailureFeedback;
+import com.testpilot.dto.TestExecutionResult;
 import com.testpilot.dto.TestGenerationRequest;
 import com.testpilot.dto.TestOptimizationRequest;
 import com.testpilot.service.LLMService;
 import com.testpilot.service.ProjectService;
 import com.testpilot.service.TestExecutionService;
 import com.testpilot.service.TestOptimizationService;
+import com.testpilot.utils.ExecutionFeedbackExtractor;
 import com.testpilot.utils.MavenProcessRunner;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
@@ -32,8 +35,10 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -44,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -547,6 +553,184 @@ class SystemFlowIntegrationTest {
                 "最终落盘的 surefire 汇总报告应为成功结果（来自第二次执行，而非首次失败）");
     }
 
+    // ============================== 用例 C：初始 MAIN_SOURCE 不触发自动修复 ==============================
+
+    /**
+     * 用例 C：初始执行即为主源码（MAIN_SOURCE）编译错误时的反向路径加固验证。
+     * <p>
+     * 验证目标：
+     * <ol>
+     *   <li>真实 {@link ExecutionFeedbackExtractor} 能把业务源码编译错误识别为 MAIN_SOURCE；</li>
+     *   <li>优化流程不调用 LLM 自动修复（生成阶段之外零调用），{@code retryCount=0}；</li>
+     *   <li>用户业务源码 {@code Calculator.java} 与 {@code pom.xml} 字节内容不被修改；</li>
+     *   <li>已生成的测试文件不被覆盖、不被删除，测试目录文件清单不变；</li>
+     *   <li>接口返回合理的终止状态（COMPILE_ERROR）与错误说明。</li>
+     * </ol>
+     * <p>
+     * 关键：Maven 输出中的编译错误路径基于真实业务源码绝对路径构造（src/main/java），
+     * 由真实 TestExecutionServiceImpl 推导 COMPILE_ERROR，再由真实 ExecutionFeedbackExtractor
+     * 判为 MAIN_SOURCE；不得 Mock TestExecutionService，也不得直接伪造 COMPILE_ERROR 状态。
+     */
+    @Test
+    void optimization_initialMainSourceCompileError_doesNotCallLlmOrTouchFiles() throws Exception {
+        // ------------------------------ C0：上传 + 解析独立项目 ------------------------------
+        byte[] zipBytes = IntegrationTestFixtures.buildProjectZip();
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "calculator.zip", "application/zip", zipBytes);
+
+        MvcResult uploadResult = mockMvc.perform(multipart("/api/projects/upload").file(file))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200))
+                .andExpect(jsonPath("$.data.projectId").exists())
+                .andReturn();
+        String projectId = readJson(uploadResult).path("data").path("projectId").asText();
+        assertFalse(projectId.isBlank(), "projectId 应非空");
+        Path extractedProjectDir = tempExtractedDir().resolve(projectId);
+
+        mockMvc.perform(post("/api/projects/{projectId}/parse", projectId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200));
+
+        // 结构守护：执行/优化服务必须是真实 Bean，MAIN_SOURCE 判定才由真实代码完成
+        assertFalse(Mockito.mockingDetails(testExecutionService).isMock(),
+                "TestExecutionService 不得被 Mock，必须为真实 TestExecutionServiceImpl");
+        assertFalse(Mockito.mockingDetails(testOptimizationService).isMock(),
+                "TestOptimizationService 不得被 Mock，必须为真实实现");
+
+        // ------------------------------ C1：生成阶段（唯一一次 LLM 调用） ------------------------------
+        when(llmService.chat(anyString()))
+                .thenReturn(IntegrationTestFixtures.llmResponseWithCalculatorTest());
+
+        TestGenerationRequest genReq = new TestGenerationRequest();
+        genReq.setClassName("Calculator");
+        genReq.setMethodName("add");
+        genReq.setParamTypes(List.of("int", "int"));
+
+        mockMvc.perform(post("/api/projects/{projectId}/tests/generate", projectId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(genReq)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200))
+                .andExpect(jsonPath("$.data.status").value("GENERATED"))
+                .andExpect(jsonPath("$.data.testFilePath")
+                        .value("src/test/java/com/example/CalculatorTest.java"));
+
+
+        // ------------------------------ C2：快照（字节 + 目录清单） ------------------------------
+        Path testFile = extractedProjectDir.resolve("src/test/java/com/example/CalculatorTest.java");
+        Path calculatorFile = extractedProjectDir.resolve("src/main/java/com/example/Calculator.java");
+        Path pomFile = extractedProjectDir.resolve("pom.xml");
+        Path testDir = testFile.getParent();
+
+        assertTrue(Files.isRegularFile(testFile), "生成的测试文件应真实存在: " + testFile);
+        byte[] testBytesBefore = Files.readAllBytes(testFile);
+        byte[] calculatorBytesBefore = Files.readAllBytes(calculatorFile);
+        byte[] pomBytesBefore = Files.readAllBytes(pomFile);
+        List<String> testDirListingBefore = listFileNames(testDir);
+        assertTrue(testDirListingBefore.contains("CalculatorTest.java"),
+                "测试目录应包含目标测试文件，实际: " + testDirListingBefore);
+
+        // 前置：生成阶段恰好调用 LLM 一次；随后清空调用记录，使后续 never() 只针对优化阶段
+        verify(llmService, times(1)).chat(anyString());
+        Mockito.clearInvocations(llmService, mavenProcessRunner);
+
+        // ------------------------------ C3：Mock Maven —— 始终返回 MAIN_SOURCE 编译失败 ------------------------------
+        // 错误路径基于真实业务源码绝对路径构造，确保真实 ExecutionFeedbackExtractor 判为 MAIN_SOURCE
+        String mainSourceErrorOutput =
+                IntegrationTestFixtures.mainSourceCompileErrorOutput(calculatorFile);
+        when(mavenProcessRunner.run(any(), any(String[].class), any(), anyInt()))
+                .thenAnswer(IntegrationTestFixtures.mavenRunnerAlwaysCompileError(mainSourceErrorOutput));
+
+        // ------------------------------ C4：调用真实优化接口 ------------------------------
+        TestOptimizationRequest optReq = new TestOptimizationRequest();
+        optReq.setClassName("Calculator");
+        optReq.setMethodName("add");
+        optReq.setParamTypes(List.of("int", "int"));
+        optReq.setMaxRetries(2);
+
+        MvcResult optResult = mockMvc.perform(post("/api/projects/{projectId}/tests/optimize", projectId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(optReq)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200))
+                .andReturn();
+        JsonNode data = readJson(optResult).path("data");
+
+
+        // ------------------------------ C5：行为证据 —— 终止状态与记录 ------------------------------
+        assertEquals(projectId, data.path("projectId").asText(), "优化结果应归属当前项目");
+        JsonNode initialResult = data.path("initialExecutionResult");
+        assertEquals("COMPILE_ERROR", initialResult.path("status").asText(),
+                "首次执行应由真实服务推导出 COMPILE_ERROR，不得直接伪造状态");
+        assertEquals(1, initialResult.path("exitCode").asInt(), "首次执行 exitCode 应为 1");
+        assertFalse(initialResult.path("success").asBoolean(), "首次执行 success 应为 false");
+        assertEquals(0, initialResult.path("totalTests").asInt(), "编译失败时不应有测试统计");
+
+        String errorMessage = initialResult.path("errorMessage").asText();
+        assertFalse(errorMessage.isBlank(), "错误说明不应为空");
+        assertTrue(errorMessage.contains("Surefire"),
+                "错误说明应指出未生成 Surefire 报告，实际: " + errorMessage);
+
+        assertFalse(data.path("optimizationSuccess").asBoolean(),
+                "MAIN_SOURCE 场景优化不应被视为成功");
+        assertEquals(0, data.path("retryCount").asInt(),
+                "MAIN_SOURCE 场景不得进入修复流程，retryCount 应为 0");
+        assertTrue(data.path("repairRecords").isArray(), "repairRecords 应为数组");
+        assertEquals(0, data.path("repairRecords").size(),
+                "MAIN_SOURCE 场景不应产生任何修复记录，实际: " + data.path("repairRecords"));
+
+        assertEquals("COMPILE_ERROR", data.path("finalExecutionResult").path("status").asText(),
+                "终止状态应为 COMPILE_ERROR（无修复后执行）");
+        assertEquals(1, data.path("finalExecutionResult").path("exitCode").asInt(),
+                "终止结果 exitCode 应为首次执行的 1");
+
+        // ------------------------------ C6：分类证据 —— 用真实 Extractor 复算实际响应 output ------------------------------
+        String actualOutput = initialResult.path("output").asText();
+        assertTrue(actualOutput.contains("/src/main/java/"),
+                "响应中的 Maven 输出应包含业务源码路径，实际: " + actualOutput);
+        assertTrue(actualOutput.contains("Calculator.java"),
+                "响应中的 Maven 输出应包含业务源码文件名，实际: " + actualOutput);
+
+        TestExecutionResult replayResult = new TestExecutionResult(
+                projectId, false, "COMPILE_ERROR", 1, 0, 0, 0, 0, 0L, actualOutput, errorMessage);
+        FailureFeedback feedback = ExecutionFeedbackExtractor.extract(
+                replayResult,
+                extractedProjectDir.resolve("target").resolve("surefire-reports"),
+                "CalculatorTest.java");
+        assertNotNull(feedback, "COMPILE_ERROR 应能提取到结构化失败反馈");
+        assertEquals(FailureFeedback.FailureType.COMPILE, feedback.getFailureType(),
+                "失败类型应为 COMPILE");
+        assertEquals(FailureFeedback.CompileErrorSource.MAIN_SOURCE,
+                feedback.getCompileErrorSource(),
+                "真实 ExecutionFeedbackExtractor 应将业务源码编译错误判为 MAIN_SOURCE");
+        assertTrue(feedback.getSummary().contains("MAIN_SOURCE"),
+                "反馈摘要应标识来源为 MAIN_SOURCE，实际: " + feedback.getSummary());
+        assertFalse(feedback.getCompileErrors().isEmpty(), "应提取到编译错误详情");
+        assertTrue(feedback.getCompileErrors().stream().anyMatch(e -> e.contains("Calculator.java")),
+                "编译错误详情应包含业务源码文件，实际: " + feedback.getCompileErrors());
+
+
+        // ------------------------------ C7：行为证据 —— 优化阶段零 LLM 调用、Maven 仅执行一次 ------------------------------
+        verify(llmService, never()).chat(anyString());
+        verify(mavenProcessRunner, times(1)).run(any(), any(String[].class), any(), anyInt());
+
+        // ------------------------------ C8：副作用证据 —— 文件字节与目录清单不变 ------------------------------
+        assertTrue(Files.isRegularFile(testFile), "优化后测试文件仍应存在，不得被删除");
+        assertArrayEquals(testBytesBefore, Files.readAllBytes(testFile),
+                "已生成的测试文件字节内容不得被修改");
+        assertArrayEquals(calculatorBytesBefore, Files.readAllBytes(calculatorFile),
+                "业务源码 Calculator.java 字节内容不得被修改");
+        assertArrayEquals(pomBytesBefore, Files.readAllBytes(pomFile),
+                "pom.xml 字节内容不得被修改");
+        assertEquals(testDirListingBefore, listFileNames(testDir),
+                "测试目录不应出现意外新增或删除的文件（如临时文件残留）");
+
+        // 未生成任何 surefire 报告（COMPILE_ERROR 的推导来源；mock 不写报告，故目录应完全不存在）
+        Path surefireDir = extractedProjectDir.resolve("target").resolve("surefire-reports");
+        assertFalse(Files.exists(surefireDir), "不应有任何 Surefire 报告（无修复后执行）");
+    }
+
+
     // ============================== 辅助方法 ==============================
 
     private Path tempProjectsDir() {
@@ -555,6 +739,19 @@ class SystemFlowIntegrationTest {
 
     private Path tempExtractedDir() {
         return TEMP_STORAGE_ROOT.resolve("extracted");
+    }
+
+    /**
+     * 列出目录下直接子文件的文件名（不递归），按名称排序，
+     * 用于断言测试目录清单在优化前后没有意外新增或删除（不依赖临时文件命名约定）。
+     */
+    private List<String> listFileNames(Path dir) throws IOException {
+        try (Stream<Path> files = Files.list(dir)) {
+            return files.filter(Files::isRegularFile)
+                    .map(p -> p.getFileName().toString())
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
     }
 
     private JsonNode readJson(MvcResult result) throws Exception {

@@ -263,6 +263,40 @@ final class IntegrationTestFixtures {
         };
     }
 
+    /**
+     * Maven 执行的 stdout：编译错误路径指向真实业务源码（src/main/java），
+     * 使真实 {@code ExecutionFeedbackExtractor} 判为 MAIN_SOURCE（不允许 LLM 自动修复）。
+     * <p>
+     * 必须满足判为 MAIN_SOURCE 的全部条件：
+     * <ul>
+     *   <li>含 {@code [ERROR] .../src/main/java/.../Calculator.java:[line,col] message}</li>
+     *   <li>不含 /src/test/java/（避免出现 TEST_SOURCE 干扰项）</li>
+     *   <li>不含依赖解析关键词、非 compiler 插件错误（否则会先被判为 DEPENDENCY / PLUGIN）</li>
+     * </ul>
+     *
+     * @param mainSourceFile 真实业务源码文件（用于构造绝对路径，而非硬编码假路径）
+     */
+    static String mainSourceCompileErrorOutput(Path mainSourceFile) {
+        String path = mainSourceFile.toAbsolutePath().toString().replace('\\', '/');
+        return "[ERROR] " + path + ":[5,8] ';' expected\n"
+                + "[ERROR] " + path + ":[5,12] cannot find symbol\n"
+                + "[ERROR]   symbol:   variable foo\n";
+    }
+
+    /**
+     * 无状态 Answer：每次调用都返回 exitCode=1 的编译失败结果，且<b>不写任何 surefire 报告</b>。
+     * <p>
+     * 用于"初始即 MAIN_SOURCE"场景：若优化流程发生错误重试，Maven 调用次数会大于 1；
+     * 且真实 TestExecutionServiceImpl 每次都会推导出 COMPILE_ERROR，不会被误判为 PASSED。
+     *
+     * @param compileErrorOutput Maven 执行返回的 stdout（含真实格式的编译错误行）
+     */
+    static Answer<ProcessResult> mavenRunnerAlwaysCompileError(String compileErrorOutput) {
+        final ProcessResult compileFailResult =
+                new ProcessResult(1, compileErrorOutput, "", false, 800L);
+        return (InvocationOnMock invocation) -> compileFailResult;
+    }
+
     private static void writeSurefireReports(Path mavenDir) throws IOException {
         Path reportsDir = mavenDir.resolve("target").resolve("surefire-reports");
         Files.createDirectories(reportsDir);
