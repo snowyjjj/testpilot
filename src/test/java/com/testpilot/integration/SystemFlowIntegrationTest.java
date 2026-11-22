@@ -12,6 +12,7 @@ import com.testpilot.service.TestExecutionService;
 import com.testpilot.service.TestOptimizationService;
 import com.testpilot.utils.ExecutionFeedbackExtractor;
 import com.testpilot.utils.MavenProcessRunner;
+import com.testpilot.utils.ProjectExecutionLock;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,6 +26,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.ResultActions;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
@@ -35,6 +37,10 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -124,6 +130,10 @@ class SystemFlowIntegrationTest {
     /** 真实 TestOptimizationServiceImpl（未被 Mock），用于结构守护断言。 */
     @Autowired
     private TestOptimizationService testOptimizationService;
+
+    /** 真实 ProjectExecutionLock（Spring 单例），用于用例 D 的并发锁冲突验证。 */
+    @Autowired
+    private ProjectExecutionLock projectExecutionLock;
 
     // ============================== 第一步：基础设施验证 ==============================
 
@@ -731,6 +741,167 @@ class SystemFlowIntegrationTest {
     }
 
 
+    // ============================== 用例 D：并发锁冲突与 HTTP 409 ==============================
+
+    /**
+     * 用例 D：真实 HTTP 并发锁冲突（409）与零副作用。
+     * <p>
+     * 由独立 holder 线程持有真实 {@link ProjectExecutionLock}，主测试线程（即 MockMvc 请求线程）
+     * 依次调用执行 / 覆盖率 / 优化 / 质量评估四个接口，全部必须返回 HTTP 409 且业务 code=409。
+     * <p>
+     * 关键：MockMvc 在调用线程内执行请求，而 {@code ReentrantLock} 支持同线程重入——
+     * 若由测试线程自己持锁再发请求，服务端 tryLock 会成功，形成假绿。
+     * 因此锁必须由独立线程持有，并全程用 {@link CountDownLatch} 同步，不使用 sleep。
+     * <p>
+     * 零副作用：锁冲突发生在任何业务处理之前，故不得启动 Maven、不得调用 LLM、
+     * 不得生成 target 报告，也不得修改业务源码 / pom.xml / 已生成测试文件。
+     * 释放锁后再次执行必须成功（PASSED），证明 409 是临时锁冲突而非锁泄漏。
+     */
+    @Test
+    void concurrentLockConflict_returns409ForFourEndpoints_withoutSideEffects() throws Exception {
+        // ------------------------------ D0：上传 + 解析 + 生成已有测试文件 ------------------------------
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "calculator.zip", "application/zip",
+                IntegrationTestFixtures.buildProjectZip());
+
+        MvcResult uploadResult = mockMvc.perform(multipart("/api/projects/upload").file(file))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200))
+                .andExpect(jsonPath("$.data.projectId").exists())
+                .andReturn();
+        String projectId = readJson(uploadResult).path("data").path("projectId").asText();
+        assertFalse(projectId.isBlank(), "projectId 应非空");
+        Path extractedProjectDir = tempExtractedDir().resolve(projectId);
+
+        mockMvc.perform(post("/api/projects/{projectId}/parse", projectId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200));
+
+        when(llmService.chat(anyString()))
+                .thenReturn(IntegrationTestFixtures.llmResponseWithCalculatorTest());
+
+        TestGenerationRequest genReq = new TestGenerationRequest();
+        genReq.setClassName("Calculator");
+        genReq.setMethodName("add");
+        genReq.setParamTypes(List.of("int", "int"));
+
+        mockMvc.perform(post("/api/projects/{projectId}/tests/generate", projectId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(genReq)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200))
+                .andExpect(jsonPath("$.data.status").value("GENERATED"));
+
+        Path testFile = extractedProjectDir.resolve("src/test/java/com/example/CalculatorTest.java");
+        Path calculatorFile = extractedProjectDir.resolve("src/main/java/com/example/Calculator.java");
+        Path pomFile = extractedProjectDir.resolve("pom.xml");
+        Path testDir = testFile.getParent();
+
+        assertTrue(Files.isRegularFile(testFile), "生成的测试文件应真实存在: " + testFile);
+        byte[] testBytesBefore = Files.readAllBytes(testFile);
+        byte[] calculatorBytesBefore = Files.readAllBytes(calculatorFile);
+        byte[] pomBytesBefore = Files.readAllBytes(pomFile);
+        List<String> testDirListingBefore = listFileNames(testDir);
+        assertTrue(testDirListingBefore.contains("CalculatorTest.java"),
+                "测试目录应包含目标测试文件，实际: " + testDirListingBefore);
+
+        // 生成阶段恰好一次 LLM 调用；仅清空调用记录（保留 stubbing），供后续 never() 断言
+        verify(llmService, times(1)).chat(anyString());
+        Mockito.clearInvocations(llmService, mavenProcessRunner);
+
+        // ------------------------------ D1：独立 holder 线程持锁 ------------------------------
+        CountDownLatch acquired = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Throwable> holderError = new AtomicReference<>();
+        AtomicBoolean lockAcquired = new AtomicBoolean(false);
+
+        Thread holder = new Thread(() -> {
+            try {
+                if (!projectExecutionLock.tryLock(projectId)) {
+                    throw new IllegalStateException("holder 线程未能获取项目锁，可能已被其他请求占用");
+                }
+                lockAcquired.set(true);
+                acquired.countDown();
+                if (!release.await(30, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("holder 线程等待 release 超时");
+                }
+            } catch (Throwable t) {
+                holderError.set(t);
+                acquired.countDown();
+            } finally {
+                // 必须在 finally 中释放：断言失败时也不得遗留项目锁
+                projectExecutionLock.unlock(projectId);
+            }
+        }, "case-d-lock-holder");
+        holder.start();
+
+        try {
+            assertTrue(acquired.await(5, TimeUnit.SECONDS), "holder 线程应在 5s 内获取项目锁");
+            assertNull(holderError.get(), "holder 线程获取锁阶段不应抛出异常");
+            assertTrue(lockAcquired.get(), "holder 线程必须真实持有项目锁");
+
+            // ------------------------------ D2：四个入口全部真实返回 HTTP 409 ------------------------------
+            assertLockConflict409(mockMvc.perform(
+                            post("/api/projects/{projectId}/tests/execute", projectId)),
+                    "该项目正在执行测试，请稍后重试");
+            assertLockConflict409(mockMvc.perform(
+                            post("/api/projects/{projectId}/coverage", projectId)),
+                    "该项目正在执行测试，请稍后重试");
+
+            // optimize 使用真实 DTO 的合法 JSON，避免 @Valid 校验先返回 400
+            TestOptimizationRequest optReq = new TestOptimizationRequest();
+            optReq.setClassName("Calculator");
+            optReq.setMethodName("add");
+            optReq.setParamTypes(List.of("int", "int"));
+            optReq.setMaxRetries(2);
+            assertLockConflict409(mockMvc.perform(
+                            post("/api/projects/{projectId}/tests/optimize", projectId)
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content(objectMapper.writeValueAsString(optReq))),
+                    "该项目正在执行测试优化，请稍后重试");
+
+            assertLockConflict409(mockMvc.perform(
+                            post("/api/projects/{projectId}/quality", projectId)),
+                    "该项目正在执行其他操作，请稍后重试");
+
+            // ------------------------------ D3：零副作用（仍持锁，先于正向对照） ------------------------------
+            verify(mavenProcessRunner, never()).run(any(), any(String[].class), any(), anyInt());
+            verify(llmService, never()).chat(anyString());
+
+            assertFalse(Files.exists(extractedProjectDir.resolve("target").resolve("surefire-reports")),
+                    "锁冲突时不得生成 Surefire 报告");
+            assertFalse(Files.exists(extractedProjectDir.resolve("target").resolve("site").resolve("jacoco")),
+                    "锁冲突时不得生成 JaCoCo 报告");
+
+            assertArrayEquals(calculatorBytesBefore, Files.readAllBytes(calculatorFile),
+                    "锁冲突后业务源码 Calculator.java 字节内容不得被修改");
+            assertArrayEquals(pomBytesBefore, Files.readAllBytes(pomFile),
+                    "锁冲突后 pom.xml 字节内容不得被修改");
+            assertArrayEquals(testBytesBefore, Files.readAllBytes(testFile),
+                    "锁冲突后已生成的测试文件字节内容不得被修改");
+            assertEquals(testDirListingBefore, listFileNames(testDir),
+                    "锁冲突后测试目录不应出现意外新增或删除的文件");
+        } finally {
+            // 断言失败也必须释放 holder 并等待退出，避免遗留后台线程 / 项目锁
+            release.countDown();
+            holder.join(5000);
+        }
+
+        // ------------------------------ D4：holder 正常退出 + 释放锁后正向对照 ------------------------------
+        assertFalse(holder.isAlive(), "holder 线程应在释放锁后 5s 内退出，不得遗留后台线程");
+        assertNull(holderError.get(), "holder 线程不得抛出异常: " + holderError.get());
+
+        when(mavenProcessRunner.run(any(), any(String[].class), any(), anyInt()))
+                .thenAnswer(IntegrationTestFixtures.mavenRunnerWritingReports());
+
+        mockMvc.perform(post("/api/projects/{projectId}/tests/execute", projectId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(200))
+                .andExpect(jsonPath("$.data.status").value("PASSED"))
+                .andExpect(jsonPath("$.data.success").value(true));
+
+    }
+
     // ============================== 辅助方法 ==============================
 
     private Path tempProjectsDir() {
@@ -756,6 +927,19 @@ class SystemFlowIntegrationTest {
 
     private JsonNode readJson(MvcResult result) throws Exception {
         return objectMapper.readTree(result.getResponse().getContentAsString());
+    }
+
+    /**
+     * 断言接口因项目锁冲突返回 HTTP 409：状态码、业务 code、精确提示语、无 data。
+     * 必须精确匹配各入口自己的锁冲突文案：优化 / 质量评估的内层执行锁也会抛 409 且文案
+     * 同样含“请稍后重试”，若只做包含断言，就无法证明 409 来自该入口自身的外层项目锁。
+     * 精确文案同时可与其他 409 来源（如生成文件已存在）区分。
+     */
+    private void assertLockConflict409(ResultActions actions, String expectedMessage) throws Exception {
+        actions.andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value(409))
+                .andExpect(jsonPath("$.message").value(expectedMessage))
+                .andExpect(jsonPath("$.data").doesNotExist());
     }
 
     /**
