@@ -1,11 +1,11 @@
 # TestPilot 项目交接文件
 
-> 交接日期：2026-11-22（阶段 8 完成后更新）
+> 交接日期：2026-11-22（阶段 8 已完成并归档）
 > 仓库根目录：`D:\Program Files\JetBrains\TestPilot`
 > 远端仓库：GitHub `https://github.com/snowyjjj/testpilot.git`
-> 当前分支：`main`（与 `origin/main` 完全同步，0 ahead / 0 behind）
-> 当前 HEAD：`2759def test(phase8): 新增真实容器级系统链路集成测试`
-> 全量测试：`327 run / 0 failures / 0 errors / 10 skipped / BUILD SUCCESS`
+> 当前分支：`main`（领先 `origin/main` 2 个提交，尚未 push）
+> 当前 HEAD：`62461b8 test(phase8): 增加并发锁冲突 HTTP 集成测试`
+> 全量测试：`329 run / 0 failures / 0 errors / 10 skipped / BUILD SUCCESS`
 
 ---
 
@@ -69,7 +69,7 @@ mvn spring-boot:run
 | 6.2 | 执行结果 + 覆盖率整合 | `TestQualityServiceImpl`、`TestQualityResult` |
 | 6.3 | 质量评分与改进建议 | `QualityScorer`、`QualityReport`、`QualityDimension`、`QualityIssue` |
 | 7 | 系统级验收前置审查 | （只读审查，无代码产物） |
-| 8 | 系统级集成测试 | `SystemFlowIntegrationTest`（用例 A + 用例 B）、`IntegrationTestFixtures` |
+| 8 | 系统级集成测试（✅ 已完成） | `SystemFlowIntegrationTest`（用例 A + B + C + D）、`IntegrationTestFixtures` |
 
 ---
 
@@ -95,6 +95,7 @@ mvn spring-boot:run
 
 ### 6.1 并发锁
 - `ProjectExecutionLock`：Spring 单例，底层 `ReentrantLock`，按 projectId 隔离，**支持同线程重入**。测试执行 / 测试优化 / 覆盖率分析 / 质量评估共用同一把锁；锁被占用时第二个请求返回 **HTTP 409**。
+- 锁冲突统一抛 `BusinessException(409, ...)`，由 `GlobalExceptionHandler` 映射为 HTTP 409；文案区分入口：执行 / 覆盖率「该项目正在执行测试，请稍后重试」、优化「该项目正在执行测试优化，请稍后重试」、质量评估「该项目正在执行其他操作，请稍后重试」。集成用例 D 对这些文案做**精确断言**，避免优化 / 质量评估的内层执行锁 409 冒充入口外层锁。
 - `TestGenerationServiceImpl` 在**真正写文件前**才获取锁（不让 LLM 调用持锁）。
 - `ProjectServiceImpl.ensureExtracted()` 首次解压：per-projectId 阻塞锁 + 双重检查 + 临时目录 `ATOMIC_MOVE` 原子移交，失败清理临时目录。
 
@@ -128,50 +129,67 @@ mvn spring-boot:run
 
 ### 7.1 全量基线
 
-**当前基线**：`mvn -o -B test` → **327 run / 0 failures / 0 errors / 10 skipped / BUILD SUCCESS**（在提交 `2759def` 上实测）。
+**当前基线**：`mvn -o -B test` → **329 run / 0 failures / 0 errors / 10 skipped / BUILD SUCCESS**（在提交 `62461b8` 上实测）。
 
 - 集成测试 `SystemFlowIntegrationTest`（`@SpringBootTest + @AutoConfigureMockMvc`，仅 Mock `LLMService` 与 `MavenProcessRunner`）：
   - 基础设施验证（通过反射确认 `ProjectServiceImpl` 注入的存储路径指向临时目录；实测默认 `storage/` 未被写入）。
   - **用例 A**：完整业务链路（上传→解析→生成→执行→覆盖率→质量评估），含确定性评分断言（EFFECTIVENESS 100 / COVERAGE 67.5 / SUFFICIENCY 30 / CORRECTNESS 100 / overallScore 77.875 / grade B）。
   - **用例 B**：编译错误修复闭环（生成含 `multiply` 错误调用 → 首次 Maven exitCode=1 不写报告 → 真实推导 COMPILE_ERROR → 反馈判 TEST_SOURCE → LLM 修复 → 二次执行 PASSED），含 LLM/Maven 各恰好 2 次调用、第二次 prompt 含首次编译错误、业务源码与 pom 未变等断言。
+  - **用例 C**：MAIN_SOURCE 编译错误不得自动修复（真实执行 + 真实反馈分类 → `retryCount=0`、生成阶段之外零 LLM、测试文件 / 业务源码 / pom 字节不变、测试目录清单不变）。
+  - **用例 D**：并发锁冲突 409 与零副作用（独立 holder 线程持锁 → execute / coverage / optimize / quality 四入口均返回 HTTP 409 且**精确文案**匹配、无 `data`；Maven / LLM 零调用、无 surefire / jacoco 报告、三文件字节与测试目录清单不变；释放锁后正向执行 200 / PASSED / success=true）。
 - 10 个 skipped 均为 Windows 符号链接假设型单元测试（`TestFileManagerTest` 3、`SurefireReportParserTest` 2、`TestExecutionServiceImplTest` 2、`TestQualityAnalyzerTest` 2、`TestGenerationServiceImplTest` 1），与近期改动无关。
 
-### 7.2 阶段 8 交付记录（2026-11-22 完成）
+### 7.2 阶段 8 交付记录（2026-11-22，✅ 已完成）
 
-阶段 8（系统级集成测试）已完成只读评审（结论 **Approve**）、提交并推送。
+阶段 8（系统级集成测试）已完成交付与只读评审（结论 **Approve with Suggestions**）；评审提出的唯一建议 M1（409 文案只做“包含”断言，无法证明 409 来自入口自身外层锁）已修复并复验。
+
+| 用例 | 覆盖内容 | 提交 |
+|------|----------|------|
+| 基础设施 | 临时存储重定向；默认 `storage/` 未被创建或污染 | `2759def` |
+| A | 完整业务链路：上传 → 解析 → 生成 → 执行 → 覆盖率 → 质量评估（确定性评分断言） | `2759def` |
+| B | TEST_SOURCE 编译错误修复闭环：真实执行 → 真实反馈分类 → LLM 修复 → 二次执行 PASSED | `2759def` |
+| C | MAIN_SOURCE 编译错误不得自动修复：`retryCount=0`、零 LLM、测试文件 / 业务源码 / pom 字节与目录清单不变 | `d5ba7e5` |
+| D | 并发锁冲突与零副作用：四入口真实 HTTP 409（精确文案）、Maven / LLM 零调用、无报告产物、文件零改动；释放后正向执行 200 / PASSED | `62461b8` |
+
+对应测试方法：`contextStarts_withTempStorageRedirected_andNoDefaultStoragePollution`（基础设施）、`fullBusinessFlow_upload_parse_generate_execute_coverage_quality`（A）、`optimizationClosedLoop_compileErrorThenRepair_passes`（B）、`optimization_initialMainSourceCompileError_doesNotCallLlmOrTouchFiles`（C）、`concurrentLockConflict_returns409ForFourEndpoints_withoutSideEffects`（D）。
 
 | 项 | 内容 |
 |----|------|
-| 交付文件 | `src/test/java/com/testpilot/integration/SystemFlowIntegrationTest.java`（629 行）、`IntegrationTestFixtures.java`（288 行） |
-| 提交 | `2759def test(phase8): 新增真实容器级系统链路集成测试`（2 files changed, 917 insertions） |
-| 推送 | 已推送至 `origin/main`；本地与远端 SHA 均为 `2759def3480e0ae134d968bfa9bab63e0155e80a` |
-| 全量验证 | `mvn -o -B test` → 327 / 0 / 0 / 10，BUILD SUCCESS；集成测试类 3/3 通过 |
+| 交付文件 | `src/test/java/com/testpilot/integration/SystemFlowIntegrationTest.java`（1010 行）、`IntegrationTestFixtures.java`（290 行） |
+| 提交（A/B） | `2759def test(phase8): 新增真实容器级系统链路集成测试`（2 files changed, +917） |
+| 提交（C） | `d5ba7e5 test(phase8): 增加 MAIN_SOURCE 不触发自动修复集成测试`（2 files changed, +231） |
+| 提交（D） | `62461b8 test(phase8): 增加并发锁冲突 HTTP 集成测试`（1 file changed, +184） |
+| 推送 | `2759def` 已推送；`d5ba7e5`、`62461b8` 仍仅在本地（`origin/main` = `b601c93`），待 push |
+| 全量验证 | `mvn -o -B test` → 329 run / 0 failures / 0 errors / 10 skipped，BUILD SUCCESS；集成测试类 5/5；用例 D 单独重复 5 次全绿 |
 | Mock 边界 | 仅 `LLMService`、`MavenProcessRunner` 被 `@MockBean`；Controller / Service / `ProjectExecutionLock` / `SurefireReportParser` / `JacocoReportParser` / `TestQualityAnalyzer` / `QualityScorer` / `PromptBuilder` / `TestFileManager` / 文件系统全部真实 |
 | 隔离实测 | `storage/projects` 运行前后均为 6 个文件；`storage/extracted` 无新增目录；`%TEMP%\testpilot-it-*` 运行后 0 个 |
-| 提交范围 | 仅上述两个测试文件；`TestClassStat.java`（行尾假象）与 `HANDOVER.md` 均未提交 |
+| D 关键设计 | holder 由**独立线程**持锁（MockMvc 在测试线程同步执行，若测试线程自持 `ReentrantLock` 会重入导致假绿）；全程 `CountDownLatch` 同步、无 sleep；`finally` 中 `release.countDown()` + `join` + `holder.isAlive()` 断言，异常经 `AtomicReference` 传递 |
+| D 精确文案 | execute / coverage：`该项目正在执行测试，请稍后重试`；optimize：`该项目正在执行测试优化，请稍后重试`；quality：`该项目正在执行其他操作，请稍后重试`（精确匹配，防止内层执行锁 409 冒充外层锁） |
+| 提交范围 | 仅测试文件；`TestClassStat.java`（行尾假象）与 `HANDOVER.md` 均未混入提交 |
 
 **阶段 8 遗留加强项（评审记录，未实施，不阻塞）**：
 
-1. Maven 调用契约（`args` goals / `timeout` / `maxLogLength`）尚未断言，建议用 `ArgumentCaptor<String[]>` + `verify(times(5))` 固化。
-2. 反向安全路径未覆盖：MAIN_SOURCE 编译错误不得自动修复、FAILED（断言失败）修复闭环、并发冲突 409。
+1. Maven 调用契约（`args` goals / `timeout` / `maxLogLength`）尚未断言，建议用 `ArgumentCaptor<String[]>` + `verify(times(n))` 固化。
+2. 反向与异常路径仍有缺口：FAILED（断言失败）修复闭环、超时 / MAVEN_ERROR 分支的集成级验证。
 3. 旧报告清理护栏未验证（未预置脏 surefire / jacoco 产物）。
 4. 首轮生成 prompt 内容未断言（`ArgumentCaptor` 目前仅用于修复 prompt）。
 5. `readJson` 建议显式 `getContentAsString(StandardCharsets.UTF_8)`，避免 Mock 响应默认按 ISO-8859-1 解码。
+6. 跨 `projectId` 隔离（D7）、跨服务锁组合（P2）与部分单测中的 `Thread.sleep` → latch 重构（P3）尚未实施。
 
 ---
 
 ## 八、当前 Git 状态
 
 ```
-## main...origin/main                     （完全同步，0 ahead / 0 behind）
+## main...origin/main                     （ahead 2 / behind 0，尚未 push）
  M src/main/java/com/testpilot/dto/TestClassStat.java    ← 纯 CRLF/LF 行尾假象，无实际内容差异，勿提交
-?? HANDOVER.md                                          ← 本文档，当前未纳入版本控制
+ M HANDOVER.md                                          ← 本次文档更新，需单独提交
 ```
 
-- 阶段 8 已提交并推送：`2759def test(phase8): 新增真实容器级系统链路集成测试`（2 files changed, +917），远端 `origin/main` 与本地 SHA 一致（`2759def3480e0ae134d968bfa9bab63e0155e80a`）。
-- 工作区唯一"修改"是 `TestClassStat.java` 的行尾假象：`git hash-object` 与 `git rev-parse HEAD:src/main/java/com/testpilot/dto/TestClassStat.java` 均为 `d52b300c92f6d948901cb50b72bb2f1e8b0b93cd`，`git diff` 无内容差异，**不要提交，也不要对其做 EOL 归一化**。
-- `HANDOVER.md` 未跟踪；如需纳入版本控制，请单独 `git add HANDOVER.md` 并提交，勿与源码改动混在一起。
-- 未切换分支、未改写历史；本地 `main` 与 `origin/main` 指向同一提交。
+- 阶段 8 已完成提交：`2759def`（已推送）、`d5ba7e5`、`62461b8`（本地未推送）；`origin/main` 仍为 `b601c93 docs: 更新阶段 8 交接文档`。
+- 工作区唯一的源码"修改"是 `TestClassStat.java` 的行尾假象：`git hash-object` 与 `git rev-parse HEAD:src/main/java/com/testpilot/dto/TestClassStat.java` 均为 `d52b300c92f6d948901cb50b72bb2f1e8b0b93cd`，`git diff` 无内容差异，**不要提交，也不要对其做 EOL 归一化**。
+- `HANDOVER.md` 已纳入版本控制（`b601c93` 引入）；本次更新请单独 `git add HANDOVER.md` 并提交，勿与源码改动混在一起。
+- 未切换分支、未改写历史；如需同步远端，执行 `git push origin main`（将包含 `d5ba7e5`、`62461b8`）。
 
 ---
 
@@ -189,10 +207,11 @@ mvn spring-boot:run
 
 ## 十、建议后续工作
 
-1. 补强阶段 8 集成测试断言：Maven 调用契约（`args` / `timeout` / `maxLogLength`）、首轮生成 prompt 内容、脏报告预置断言、`issues` / `reliabilityWarning` 断言。
-2. 补充反向与异常路径集成测试：MAIN_SOURCE 编译错误不得自动修复、FAILED（断言失败）修复闭环、并发冲突 409。
-3. 用 Postman 对阶段 8 用例 A/B 做端到端人工验收（仓库含 `.postman` / `postman` 目录）。
-4. 如需部署，补充认证与执行沙箱。
+1. 推送阶段 8 剩余提交：`git push origin main`（本地领先 2 个提交：`d5ba7e5`、`62461b8`）。
+2. 补强阶段 8 集成测试断言：Maven 调用契约（`args` / `timeout` / `maxLogLength`）、首轮生成 prompt 内容、脏报告预置断言、`issues` / `reliabilityWarning` 断言。
+3. 补充仍缺失的反向与异常路径：FAILED（断言失败）修复闭环、超时 / MAVEN_ERROR、跨 projectId 并发隔离（D7）。
+4. 用 Postman 对阶段 8 用例 A/B/C/D 做端到端人工验收（仓库含 `.postman` / `postman` 目录）。
+5. 如需部署，补充认证与执行沙箱。
 
 ---
 
