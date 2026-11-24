@@ -253,10 +253,20 @@ public class TestExecutionServiceImpl implements TestExecutionService {
         boolean success;
         String errorMessage = "";
 
+        if (!processResult.isTimedOut() && processResult.isOutputLimitExceeded()
+                && processResult.getExitCode() != -1) {
+            log.warn("Maven 进程已自然退出，但输出超过磁盘上限，保留真实退出码: {}",
+                    processResult.getExitCode());
+        }
+
         if (processResult.isTimedOut()) {
             status = "TIMEOUT";
             success = false;
             errorMessage = "Maven 执行超时（" + timeoutSeconds + " 秒），已强制终止";
+        } else if (processResult.isOutputLimitExceeded() && processResult.getExitCode() == -1) {
+            status = "MAVEN_ERROR";
+            success = false;
+            errorMessage = "Maven 输出超过磁盘上限，已终止执行";
         } else if (processResult.getExitCode() == -1) {
             status = "MAVEN_ERROR";
             success = false;

@@ -7,13 +7,16 @@ import com.testpilot.service.impl.TestExecutionServiceImpl;
 import com.testpilot.utils.JacocoReportParser;
 import com.testpilot.utils.MavenProcessRunner;
 import com.testpilot.utils.ProcessResult;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.stubbing.Answer;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -22,9 +25,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -32,15 +38,21 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class TestExecutionServiceImplTest {
+
+    private static final int TEST_TIMEOUT_SECONDS = 120;
+    private static final int TEST_MAX_LOG_LENGTH = 51200;
+    private static final String TEST_JACOCO_VERSION = "0.8.11";
 
     private ProjectService projectService;
     private MavenProcessRunner processRunner;
@@ -54,6 +66,10 @@ class TestExecutionServiceImplTest {
         projectService = mock(ProjectService.class);
         processRunner = mock(MavenProcessRunner.class);
         service = new TestExecutionServiceImpl(projectService, processRunner, new com.testpilot.utils.ProjectExecutionLock());
+        // 生产代码通过 Spring @Value 注入；单元测试直接 new，需要显式注入与 application.yml 一致的默认值。
+        ReflectionTestUtils.setField(service, "timeoutSeconds", TEST_TIMEOUT_SECONDS);
+        ReflectionTestUtils.setField(service, "maxLogLength", TEST_MAX_LOG_LENGTH);
+        ReflectionTestUtils.setField(service, "jacocoVersion", TEST_JACOCO_VERSION);
     }
 
     private void writeSurefireReport(Path mavenDir, String content) throws IOException {
@@ -72,6 +88,27 @@ class TestExecutionServiceImplTest {
             writeSurefireReport(mavenDir, reportContent);
             return result;
         };
+    }
+
+    private String[] prepareAgentTestArgs() {
+        return new String[]{
+                "org.jacoco:jacoco-maven-plugin:" + TEST_JACOCO_VERSION + ":prepare-agent",
+                "test"
+        };
+    }
+
+    private String[] jacocoReportArgs() {
+        return new String[]{
+                "org.jacoco:jacoco-maven-plugin:" + TEST_JACOCO_VERSION + ":report"
+        };
+    }
+
+    private boolean isPrepareAgentTestArgs(String[] args) {
+        return Arrays.equals(prepareAgentTestArgs(), args);
+    }
+
+    private boolean isJacocoReportArgs(String[] args) {
+        return Arrays.equals(jacocoReportArgs(), args);
     }
 
     @Test
@@ -137,6 +174,67 @@ class TestExecutionServiceImplTest {
     }
 
     @Test
+    void executeTests_timeoutAndOutputLimit_timeoutTakesPrecedence() {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenReturn(new ProcessResult(-1, "...", "", true, 120000L, true));
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        assertFalse(result.isSuccess());
+        assertEquals("TIMEOUT", result.getStatus(), "TIMEOUT 必须优先于输出超限");
+        assertEquals(-1, result.getExitCode());
+        assertTrue(result.getErrorMessage().contains("超时"));
+        assertFalse(result.getErrorMessage().contains("输出超过磁盘上限"));
+    }
+
+    @Test
+    void executeTests_outputLimitTerminated_mavenErrorWithSpecificMessage() {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenReturn(new ProcessResult(-1, "partial output", "", false, 1000L, true));
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        assertFalse(result.isSuccess());
+        assertEquals("MAVEN_ERROR", result.getStatus());
+        assertEquals(-1, result.getExitCode());
+        assertEquals("Maven 输出超过磁盘上限，已终止执行", result.getErrorMessage());
+    }
+
+    @Test
+    void executeTests_outputLimitButExitZero_keepsNormalSuccess() throws IOException {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenAnswer(runWithReport(
+                        new ProcessResult(0, "BUILD SUCCESS", "", false, 900L, true),
+                        "Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n"));
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        assertTrue(result.isSuccess(), "自然退出且退出码为 0 时应保持原有成功判定");
+        assertEquals("PASSED", result.getStatus());
+        assertEquals(0, result.getExitCode());
+        assertEquals("", result.getErrorMessage());
+    }
+
+    @Test
+    void executeTests_outputLimitButNaturalNonZeroExit_keepsOriginalMapping() {
+        when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
+        when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
+                .thenReturn(new ProcessResult(1, "COMPILATION ERROR", "symbol not found",
+                        false, 800L, true));
+
+        TestExecutionResult result = service.executeTests("p1");
+
+        assertFalse(result.isSuccess());
+        assertEquals("COMPILE_ERROR", result.getStatus(),
+                "自然退出且保留真实退出码时不得改写为输出超限的 MAVEN_ERROR");
+        assertEquals(1, result.getExitCode());
+        assertFalse(result.getErrorMessage().contains("输出超过磁盘上限"));
+    }
+
+    @Test
     void executeTests_exitZeroNoReports_noReportsStatus() {
         when(projectService.getMavenProjectDir("p1")).thenReturn(tempDir);
         when(processRunner.run(eq(tempDir), any(String[].class), any(), anyInt()))
@@ -162,8 +260,9 @@ class TestExecutionServiceImplTest {
 
         TestExecutionResult result = service.executeTests("p1");
 
-        // 默认 max-log-length 51200，输出应被截断
-        assertTrue(result.getOutput().length() <= 51200 + 100);
+        // 注入的 max-log-length 为 51200，输出应精确截断并追加提示
+        assertEquals(TEST_MAX_LOG_LENGTH + "\n... (output truncated)".length(),
+                result.getOutput().length());
         assertTrue(result.getOutput().contains("truncated"));
     }
 
@@ -235,8 +334,14 @@ class TestExecutionServiceImplTest {
 
         service.executeTests("p1");
 
-        // 验证只传入固定的 "test" 参数，不接受用户输入
-        verify(processRunner).run(eq(tempDir), eq(new String[]{"test"}), any(), anyInt());
+        // 验证只传入固定的 "test" 参数，不接受用户输入，并校验生产默认 timeout / maxLogLength
+        ArgumentCaptor<String[]> argsCaptor = ArgumentCaptor.forClass(String[].class);
+        ArgumentCaptor<Duration> timeoutCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(processRunner).run(eq(tempDir), argsCaptor.capture(), timeoutCaptor.capture(),
+                eq(TEST_MAX_LOG_LENGTH));
+
+        assertArrayEquals(new String[]{"test"}, argsCaptor.getValue());
+        assertEquals(Duration.ofSeconds(TEST_TIMEOUT_SECONDS), timeoutCaptor.getValue());
     }
 
     @Test
@@ -420,23 +525,21 @@ class TestExecutionServiceImplTest {
             Path mavenDir = invocation.getArgument(0);
             String[] args = invocation.getArgument(1);
 
-            // 每次调用都写 surefire 报告
-            if (surefireContent != null) {
-                writeSurefireReport(mavenDir, surefireContent);
-            }
-
-            boolean isFirstCall = args != null && args.length >= 1 && args[0].contains("prepare-agent");
-            boolean isReportCall = args != null && args.length >= 1
-                    && args[0].contains("jacoco-maven-plugin") && args[0].contains(":report");
-
-            if (isFirstCall) {
-                Path jacocoExec = mavenDir.resolve("target").resolve("jacoco.exec");
-                Files.createDirectories(jacocoExec.getParent());
-                Files.write(jacocoExec, new byte[]{1, 2, 3, 4, 5});
+            if (isPrepareAgentTestArgs(args)) {
+                // prepare-agent + test 已实际发起；测试断言失败（exit 1）时 Surefire/JaCoCo 仍会产出报告和 exec。
+                if (!testResult.isTimedOut() && testResult.getExitCode() >= 0) {
+                    if (surefireContent != null) {
+                        writeSurefireReport(mavenDir, surefireContent);
+                    }
+                    Path jacocoExec = mavenDir.resolve("target").resolve("jacoco.exec");
+                    Files.createDirectories(jacocoExec.getParent());
+                    Files.write(jacocoExec, new byte[]{1, 2, 3, 4, 5});
+                }
                 return testResult;
             }
 
-            if (isReportCall) {
+            if (isJacocoReportArgs(args)) {
+                // report 调用只写 JaCoCo XML，不得重写 Surefire 报告。
                 if (jacocoXmlContent != null) {
                     Path jacocoXml = mavenDir.resolve("target").resolve("site")
                             .resolve("jacoco").resolve("jacoco.xml");
@@ -446,8 +549,27 @@ class TestExecutionServiceImplTest {
                 return reportResult;
             }
 
-            return testResult;  // 普通 test 调用
+            throw new AssertionError("非预期的 Maven 调用参数: " + Arrays.toString(args));
         };
+    }
+
+    private void verifyCoverageMavenCalls(Path mavenDir) {
+        InOrder ordered = inOrder(processRunner);
+        ordered.verify(processRunner).run(
+                eq(mavenDir),
+                argThat((String[] args) -> Arrays.equals(prepareAgentTestArgs(), args)),
+                eq(Duration.ofSeconds(TEST_TIMEOUT_SECONDS)),
+                eq(TEST_MAX_LOG_LENGTH));
+        ordered.verify(processRunner).run(
+                eq(mavenDir),
+                argThat((String[] args) -> Arrays.equals(jacocoReportArgs(), args)),
+                eq(Duration.ofSeconds(TEST_TIMEOUT_SECONDS)),
+                eq(TEST_MAX_LOG_LENGTH));
+        verify(processRunner, times(2)).run(
+                eq(mavenDir),
+                any(String[].class),
+                eq(Duration.ofSeconds(TEST_TIMEOUT_SECONDS)),
+                eq(TEST_MAX_LOG_LENGTH));
     }
 
     private String validJacocoXml() {
@@ -483,6 +605,8 @@ class TestExecutionServiceImplTest {
         assertNotNull(result.getMetrics());
         assertEquals(6, result.getMetrics().size());
         assertTrue(result.getMetrics().stream().anyMatch(m -> m.isAvailable()));
+
+        verifyCoverageMavenCalls(tempDir);
     }
 
     @Test
@@ -501,6 +625,8 @@ class TestExecutionServiceImplTest {
         assertFalse(result.getTestExecutionResult().isSuccess());
         // FAILED 但覆盖率仍有效
         assertEquals("COVERAGE_GENERATED", result.getCoverageStatus());
+
+        verifyCoverageMavenCalls(tempDir);
     }
 
     @Test
@@ -515,11 +641,15 @@ class TestExecutionServiceImplTest {
         assertEquals("COMPILE_ERROR", result.getTestExecutionResult().getStatus());
         assertEquals("NO_COVERAGE", result.getCoverageStatus());
         assertTrue(result.getMetrics().isEmpty());
-        // jacoco.exec 不存在，所以不应执行 report 调用
+        verify(processRunner, times(1)).run(
+                eq(tempDir),
+                argThat((String[] args) -> Arrays.equals(prepareAgentTestArgs(), args)),
+                eq(Duration.ofSeconds(TEST_TIMEOUT_SECONDS)),
+                eq(TEST_MAX_LOG_LENGTH));
+        // jacoco.exec 不存在，所以不应执行 report 调用；必须用完整 goal 精确匹配，不能再用失效的 jacoco:report 子串。
         verify(processRunner, never()).run(eq(tempDir),
-                org.mockito.ArgumentMatchers.argThat((String[] args) ->
-                        args != null && args.length >= 1 && args[0].contains("jacoco:report")),
-                any(), anyInt());
+                argThat((String[] args) -> isJacocoReportArgs(args)),
+                eq(Duration.ofSeconds(TEST_TIMEOUT_SECONDS)), eq(TEST_MAX_LOG_LENGTH));
     }
 
     @Test
@@ -531,7 +661,7 @@ class TestExecutionServiceImplTest {
                 .thenAnswer(invocation -> {
                     Path mavenDir = invocation.getArgument(0);
                     String[] args = invocation.getArgument(1);
-                    if (args != null && args.length >= 1 && args[0].contains("prepare-agent")) {
+                    if (isPrepareAgentTestArgs(args)) {
                         // 只写 surefire，不写 jacoco.exec
                         writeSurefireReport(mavenDir,
                                 "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
@@ -555,7 +685,7 @@ class TestExecutionServiceImplTest {
                 .thenAnswer(invocation -> {
                     Path mavenDir = invocation.getArgument(0);
                     String[] args = invocation.getArgument(1);
-                    if (args != null && args.length >= 1 && args[0].contains("prepare-agent")) {
+                    if (isPrepareAgentTestArgs(args)) {
                         writeSurefireReport(mavenDir,
                                 "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
                         // 写 jacoco.exec
@@ -563,8 +693,7 @@ class TestExecutionServiceImplTest {
                         Files.createDirectories(jacocoExec.getParent());
                         Files.write(jacocoExec, new byte[]{1, 2, 3});
                     }
-                    if (args != null && args.length >= 1
-                            && args[0].contains("jacoco-maven-plugin") && args[0].contains(":report")) {
+                    if (isJacocoReportArgs(args)) {
                         // report 执行失败
                         return new ProcessResult(1, "REPORT FAILED", "", false, 300L);
                     }
@@ -578,6 +707,8 @@ class TestExecutionServiceImplTest {
         // 覆盖率失败独立报告
         assertEquals("NO_REPORT", result.getCoverageStatus());
         assertNotNull(result.getCoverageError());
+
+        verifyCoverageMavenCalls(tempDir);
     }
 
     @Test
@@ -686,7 +817,7 @@ class TestExecutionServiceImplTest {
                 .thenAnswer(inv -> {
                     Path mavenDir = inv.getArgument(0);
                     String[] args = inv.getArgument(1);
-                    if (args.length >= 2 && args[0].contains("prepare-agent")) {
+                    if (isPrepareAgentTestArgs(args)) {
                         writeSurefireReport(mavenDir,
                                 "Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.1 sec\n");
                     }
