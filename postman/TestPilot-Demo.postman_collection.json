@@ -1,0 +1,297 @@
+{
+  "info": {
+    "_postman_id": "b1f0c2d3-4a5e-4f60-8c71-9d2e3f4a5b6c",
+    "name": "TestPilot Demo",
+    "description": "TestPilot 演示集合：上传 → 解析 → 生成测试 → 执行 → 自动优化（条件步骤） → 覆盖率 → 质量评价。\n\n使用前提：\n1. 服务已启动（默认 http://localhost:8080）；\n2. 已生成示例 ZIP：powershell -ExecutionPolicy Bypass -File scripts/package-sample.ps1；\n3. 已配置环境变量 DASHSCOPE_API_KEY（生成与优化会真实调用 LLM）。\n\n使用方式：按 00 → 07 顺序执行（Collection Runner 可直接整套跑）。01 上传成功后会从响应中提取 projectId 写入 Collection 变量，后续请求全部引用该变量，不硬编码任何历史 projectId。\n\n断言约定：LLM 输出具有不确定性，本集合只断言接口契约（HTTP 200 / 业务 code / 字段结构 / 状态枚举），不断言「生成的测试一定通过」，也不断言优化一定成功。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "00 健康检查",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('data 为 OK', () => pm.expect(body.data).to.eql('OK'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "health"]
+        },
+        "description": "对应 HealthController#health（GET /api/health）。\n用途：演示前确认服务已启动。"
+      }
+    },
+    {
+      "name": "01 上传示例项目",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('上传状态为 UPLOADED', () => pm.expect(body.data.status).to.eql('UPLOADED'));",
+              "pm.test('返回 32 位 projectId', () => pm.expect(body.data.projectId).to.match(/^[0-9a-f]{32}$/));",
+              "pm.collectionVariables.set('projectId', body.data.projectId);",
+              "console.log('已写入 Collection 变量 projectId =', body.data.projectId);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "samples/demo-calculator.zip",
+              "description": "示例项目 ZIP。若 Postman 未自动带出文件，请手动选择仓库根目录下的 samples/demo-calculator.zip"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/upload",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "upload"]
+        },
+        "description": "对应 ProjectController#upload（POST /api/projects/upload，参数名 file，上限 50MB）。\n\nZIP 结构要求（ProjectServiceImpl#isRootPom）：pom.xml 必须在 ZIP 根目录，或位于唯一的一层子目录内。scripts/package-sample.ps1 生成的 ZIP 已满足该要求（pom.xml 在根目录）。\n\n响应：{ projectId, fileName, status=\"UPLOADED\" }。projectId 由服务端 UUID 生成（去掉连字符，32 位十六进制），后续所有请求都用它。"
+      }
+    }
+,
+    {
+      "name": "02 解析项目源码",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('projectId 与上传响应一致', () => pm.expect(body.data.projectId).to.eql(pm.collectionVariables.get('projectId')));",
+              "pm.test('返回解析文件列表', () => pm.expect(body.data.files).to.be.an('array').that.is.not.empty);",
+              "pm.test('没有解析失败的 Java 文件', () => pm.expect(body.data.errors).to.be.an('array').that.is.empty);",
+              "console.log('解析到的 Java 文件数 =', body.data.files.length);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/{{projectId}}/parse",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "{{projectId}}", "parse"]
+        },
+        "description": "对应 ProjectController#parse（POST /api/projects/{projectId}/parse，无请求体）。\n\n本步骤不是生成测试的前置条件（生成接口内部会自行定位方法），保留它是为了演示「Java 源码解析」能力：返回每个 .java 文件的包名、类与方法签名，以及解析失败清单（errors）。\n\n注意：解析范围是解压目录下全部 .java 文件，会包含后续生成的测试文件。"
+      }
+    },
+    {
+      "name": "03 生成单元测试",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "if (body.code === 200) {",
+              "  pm.test('状态为 GENERATED', () => pm.expect(body.data.status).to.eql('GENERATED'));",
+              "  pm.test('返回测试文件路径', () => pm.expect(body.data.testFilePath).to.include('src/test/java/'));",
+              "  console.log('生成的测试文件 =', body.data.testFilePath);",
+              "} else {",
+              "  console.log('生成失败 message =', body.message);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"className\":\"{{className}}\",\"methodName\":\"{{methodName}}\",\"paramTypes\":[\"int\",\"int\"]}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/{{projectId}}/tests/generate",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "{{projectId}}", "tests", "generate"]
+        },
+        "description": "对应 TestGenerationController#generateTest（POST /api/projects/{projectId}/tests/generate，请求体 TestGenerationRequest）。\n\n字段：className（必填）、methodName（必填）、paramTypes（顺序敏感的完整类型列表，无参方法传 [] 或省略）。\n默认值取 Calculator#divide(int,int)，因此 paramTypes 必须是 [\"int\",\"int\"]；只传 [\"int\"] 会因无法唯一确定方法而返回 400。\n\n流程：定位方法上下文 → 由 pom.xml 判定 JUnit 版本（\u003e=5 生成 JUnit 5 测试）→ 调用 LLM → 提取代码块 → 静态校验 → 原子写入 src/test/java/com/example/demo/CalculatorTest.java。\n\n常见错误：400（JUnit 版本无法识别 / 方法不存在 / 生成代码校验失败）；409（测试文件已存在，拒绝覆盖 —— 重新执行 01 上传即可获得干净项目）；500（LLM 调用失败，如 401/429）。"
+      }
+    }
+,
+    {
+      "name": "04 执行测试",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('返回合法执行状态', () => pm.expect(body.data.status).to.be.oneOf(['PASSED','FAILED','COMPILE_ERROR','MAVEN_ERROR','TIMEOUT','NO_REPORTS']));",
+              "pm.test('projectId 与上传响应一致', () => pm.expect(body.data.projectId).to.eql(pm.collectionVariables.get('projectId')));",
+              "console.log('执行状态 =', body.data.status, '/ 退出码 =', body.data.exitCode, '/ 用例数 =', body.data.totalTests, '/ 耗时(ms) =', body.data.executionTime);",
+              "pm.collectionVariables.set('lastExecutionStatus', body.data.status);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/{{projectId}}/tests/execute",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "{{projectId}}", "tests", "execute"]
+        },
+        "description": "对应 TestExecutionController#executeTests（POST /api/projects/{projectId}/tests/execute，无请求体）。\n\n执行的是固定的 mvn -B test，不接受任何用户传入的命令或参数；超时默认 120 秒（testpilot.maven.timeout-seconds）。\n\n响应字段：status / exitCode / totalTests / passedTests / failedTests / skippedTests / executionTime / output / errorMessage。\nstatus 判定顺序：TIMEOUT → MAVEN_ERROR → COMPILE_ERROR → FAILED → NO_REPORTS → PASSED。\n\n本步骤只断言状态枚举与 projectId 一致性，不断言一定 PASSED（LLM 生成的测试可能失败，这正是 05 自动优化的输入）。"
+      }
+    },
+    {
+      "name": "05 自动优化（条件步骤）",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('返回修复轮次', () => pm.expect(body.data.retryCount).to.be.a('number'));",
+              "pm.test('返回修复记录数组', () => pm.expect(body.data.repairRecords).to.be.an('array'));",
+              "pm.test('包含初始与最终执行结果', () => {",
+              "  pm.expect(body.data.initialExecutionResult).to.be.an('object');",
+              "  pm.expect(body.data.finalExecutionResult).to.be.an('object');",
+              "});",
+              "console.log('初始状态 =', body.data.initialExecutionResult.status,",
+              "  '/ 最终状态 =', body.data.finalExecutionResult.status,",
+              "  '/ 修复轮次 =', body.data.retryCount,",
+              "  '/ 是否修复成功 =', body.data.optimizationSuccess);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"className\":\"{{className}}\",\"methodName\":\"{{methodName}}\",\"paramTypes\":[\"int\",\"int\"],\"maxRetries\":2}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/{{projectId}}/tests/optimize",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "{{projectId}}", "tests", "optimize"]
+        },
+        "description": "对应 TestOptimizationController#optimizeTests（POST /api/projects/{projectId}/tests/optimize，请求体 TestOptimizationRequest）。\n\n【触发条件】这是条件性演示步骤，按 04 的 status 决定是否值得执行：\n· PASSED：不进入修复，直接返回 retryCount=0、optimizationSuccess=true（不调用 LLM）；\n· FAILED（断言失败）：进入修复循环（提取失败反馈 → LLM 修复 → 校验 @Test 与断言数量不减少且不得出现 @Disabled/@Ignore → 原子替换 → 重跑），最终仍失败则回滚；\n· COMPILE_ERROR 且错误定位为测试源码：同样进入修复循环；\n· COMPILE_ERROR 但错误来自业务源码 / 依赖 / 插件：直接返回，不调用 LLM（retryCount=0、optimizationSuccess=false）；\n· MAVEN_ERROR / TIMEOUT / NO_REPORTS：直接返回，不调用 LLM。\n\n前置条件：03 必须已成功生成测试文件，否则返回 404「未找到已生成的测试文件，请先生成测试」。\n\n耗时提醒：最坏情况会再跑 3 次 Maven（初始 + 2 轮修复）并调用 2 次 LLM。"
+      }
+    }
+,
+    {
+      "name": "06 覆盖率分析",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('覆盖率状态合法', () => pm.expect(body.data.coverageStatus).to.be.oneOf(['COVERAGE_GENERATED','NO_COVERAGE','NO_REPORT']));",
+              "pm.test('metrics 为数组', () => pm.expect(body.data.metrics).to.be.an('array'));",
+              "pm.test('保留原始测试执行结果', () => pm.expect(body.data.testExecutionResult).to.be.an('object'));",
+              "if (body.data.coverageStatus === 'COVERAGE_GENERATED') {",
+              "  const line = body.data.metrics.find(m => m.type === 'LINE');",
+              "  const branch = body.data.metrics.find(m => m.type === 'BRANCH');",
+              "  console.log('行覆盖率(%) =', line && line.percentage, '/ 分支覆盖率(%) =', branch && branch.percentage);",
+              "} else {",
+              "  console.log('coverageError =', body.data.coverageError);",
+              "}",
+              "console.log('HTML 报告：storage/extracted/<projectId>/target/site/jacoco/index.html');"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/{{projectId}}/coverage",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "{{projectId}}", "coverage"]
+        },
+        "description": "对应 CoverageController#runCoverage（POST /api/projects/{projectId}/coverage，无请求体）。\n\n内部使用 JaCoCo 命令行插件（不修改用户 pom.xml）执行两次 Maven：jacoco:prepare-agent test（收集 jacoco.exec）→ jacoco:report（生成 jacoco.xml），再解析项目级 counter。\n\ncoverageStatus 三个取值：\n· COVERAGE_GENERATED：jacoco.xml 正常解析且至少一项 metric available=true；\n· NO_COVERAGE：测试状态为 COMPILE_ERROR / MAVEN_ERROR / TIMEOUT / NO_REPORTS，无有效测试执行；\n· NO_REPORT：测试已执行但 jacoco.exec 未生成 / jacoco.xml 不存在或无有效 counter（如用户 pom 覆盖 argLine 未保留 ${argLine}、forkCount=0）。\n\nmetrics 每项包含 type（INSTRUCTION/BRANCH/LINE/METHOD/CLASS/COMPLEXITY）、available、covered、missed、percentage；percentage 为 null 表示该维度无统计意义。\n\n类级明细需打开磁盘上的 HTML 报告：storage/extracted/{projectId}/target/site/jacoco/index.html。\n\n耗时提醒：本步骤会完整再跑一次测试，最长约 2 × 120 秒。"
+      }
+    },
+    {
+      "name": "07 质量评价",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('业务 code = 200', () => pm.expect(body.code).to.eql(200));",
+              "pm.test('返回静态统计', () => pm.expect(body.data.staticStats).to.be.an('object'));",
+              "pm.test('返回覆盖率结果', () => pm.expect(body.data.coverageResult).to.be.an('object'));",
+              "pm.test('返回质量报告', () => pm.expect(body.data.qualityReport).to.be.an('object'));",
+              "if (body.data.qualityReport) {",
+              "  pm.test('等级为字符串', () => pm.expect(body.data.qualityReport.grade).to.be.a('string'));",
+              "  pm.test('返回 4 个评分维度', () => pm.expect(body.data.qualityReport.dimensions).to.have.lengthOf(4));",
+              "  console.log('综合分 =', body.data.qualityReport.overallScore,",
+              "    '/ 等级 =', body.data.qualityReport.grade,",
+              "    '/ 改进建议数 =', body.data.qualityReport.issues.length);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/projects/{{projectId}}/quality",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "projects", "{{projectId}}", "quality"]
+        },
+        "description": "对应 TestQualityController#evaluate（POST /api/projects/{projectId}/quality，无请求体）。\n\n一次调用完成三件事：测试执行 + JaCoCo 覆盖率 + 基于 JavaParser AST 的测试代码静态统计，最后由 QualityScorer 计算质量报告。\n\nqualityReport 结构：overallScore（null 表示不可评）、grade（A/B/C/D/F/N/A）、dimensions（固定 4 项：EFFECTIVENESS 0.30 / COVERAGE 0.25 / SUFFICIENCY 0.20 / CORRECTNESS 0.25）、issues（规则化中文建议 + 定量 evidence）、reliabilityWarning。\n\n预期行为：若尚未生成任何测试，覆盖率会是 NO_COVERAGE，可评维度不足 → overallScore=null、grade=\"N/A\"，这是设计上的三态语义（不可评 ≠ 0 分）。\n\n耗时提醒：内部包含完整覆盖率流程，最长约 2 × 120 秒；稳定性上建议在 06 之后执行。"
+      }
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080", "type": "string" },
+    { "key": "projectId", "value": "", "type": "string" },
+    { "key": "className", "value": "Calculator", "type": "string" },
+    { "key": "methodName", "value": "divide", "type": "string" }
+  ]
+}

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TestPilot 演示用示例 Maven 项目。
+
+  设计约束：
+  1. 只依赖 JUnit Jupiter 5.9.2（与 TestPilot 测试生成能力保持兼容），不引入其他第三方依赖。
+  2. 显式固定 compiler / surefire 版本，保证在不同 Maven 版本下 mvn test 行为一致
+     （Maven 3.8 及更早版本的默认 surefire 不支持 JUnit 5）。
+  3. 仓库内不预置任何测试类：演示时从 0 覆盖开始，由 TestPilot 生成测试。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>demo-calculator</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>demo-calculator</name>
+    <description>TestPilot demo sample project</description>
+
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <junit.jupiter.version>5.9.2</junit.jupiter.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

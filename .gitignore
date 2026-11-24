@@ -48,5 +48,7 @@ storage/
 *.pid
 
 # Postman
+# Postman 本地工作区元数据不入库；仅保留可复现演示用的集合文件
 .postman/
-postman/
+postman/*
+!postman/TestPilot-Demo.postman_collection.json
